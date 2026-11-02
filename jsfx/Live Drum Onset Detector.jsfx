@@ -1,0 +1,467 @@
+desc:Live Drum Onset Detector
+//tags: analysis drums timing
+// Part of Live Drum Groove Monitor. Audio passes through untouched.
+// Shared memory layout: docs/protocol.md. Keep in step with lua/protocol.lua.
+
+options:gmem=LiveDrumGrooveMonitor_v1
+
+slider1:lane_ui=1<1,8,1>Lane ID (1=Kick 2=Snare 3=Hi-hat)
+slider2:ch_sel=0<0,2,1{Channel 1,Channel 2,Sum 1+2}>Detect from
+slider3:thresh_db=-30<-70,0,0.1>Trigger threshold (dB)
+slider4:hyst_db=6<0,24,0.5>Hysteresis: re-arm below threshold by (dB)
+slider5:retrig_ms=40<5,200,1>Retrigger interval (ms)
+slider6:rel_ms=25<2,200,1>Envelope release (ms)
+slider7:mask_ms=150<10,1000,5>Ring mask decay (ms)
+slider8:hp_hz=0<0,5000,10>Detection high-pass (Hz, 0=off)
+slider9:lp_hz=0<0,20000,50>Detection low-pass (Hz, 0=off)
+slider10:confirm_ms=2<0,10,0.5>Peak confirm window (ms)
+slider11:backdate_on=1<0,1,1{Off,On}>Backdate to first attack
+slider12:st_mode=0<0,3,1{Off,Beats 1+3 (kick),Beats 2+4 (snare),Eighths (hat)}>Self-test pulses (detector only, inaudible)
+slider13:st_offset=0<-60,60,0.1>Self-test offset (ms)
+
+@init
+ext_noinit = 1;   // keep state across transport start; srate is checked in @block
+ext_nodenorm = 1; // no anti-denormal noise: audio must pass through unchanged
+
+// protocol constants
+PR_MAGIC = 1279539015;
+PR_VERSION = 1;
+GLOBAL_SIZE = 1024;
+LANE_STRIDE = 4096;
+RING_OFFSET = 64;
+RING_SIZE = 256;
+RECORD_SIZE = 8;
+
+G_MAGIC = 0;
+G_VERSION = 1;
+G_COUNTER = 3;
+
+H_SEQ = 0;
+H_HEARTBEAT = 1;
+H_LEVEL = 2;
+H_LAST_QN = 3;
+H_SEGMENT = 4;
+H_OWNER = 5;
+H_BLOCK_S = 6;
+H_BLOCK_QN = 7;
+H_PLAY_STATE = 8;
+H_TEMPO = 9;
+H_TS_NUM = 10;
+H_TS_DENOM = 11;
+H_SRATE = 12;
+H_SAMPLESBLOCK = 13;
+H_DUPLICATE = 14;
+H_IDLE_TRIGGERS = 15;
+H_LAST_PEAK = 16;
+H_TRIGGER_TOTAL = 17;
+H_THRESHOLD = 18;
+H_SELFTEST = 19;
+
+R_A = 0;
+R_B = 1;
+R_C = 2;
+R_COMMIT = 3;
+R_SEG = 4;
+R_KIND = 5;
+R_D = 6;
+R_E = 7;
+
+KIND_HIT = 0;
+KIND_SEG_START = 1;
+KIND_SEG_END = 2;
+
+gmem[G_MAGIC] = PR_MAGIC;
+gmem[G_VERSION] = PR_VERSION;
+
+// Unique id: shared counter plus a clock fraction, in case two instances
+// initialise at the same moment on different threads.
+gmem[G_COUNTER] += 1;
+my_id = gmem[G_COUNTER] + (time_precise() - floor(time_precise())) * 0.5 + 0.25;
+
+// attack history for backdating, 20 ms at up to 192 kHz
+hist = 0;
+HIST_LEN = 4096;
+hist_w = 0;
+
+lane_idx = -1; // forces homing in the first @block
+is_owner = 0;
+stale_blocks = 0;
+last_other_hb = -1;
+was_playing = 0;
+force_segment = 1;
+level_max = 0;
+
+env = 0;
+mask = 0;
+armed = 1;
+since = 1000000;
+confirm_left = 0;
+pending = 0;
+fire_pending = 0;
+
+hp_z1 = hp_z2 = 0;
+lp_z1 = lp_z2 = 0;
+
+st_burst = 0;
+st_next = -1;
+st_valid = 0;
+trigger_led = 0;
+
+function calc_coeffs()
+(
+  thr_on = 10 ^ (thresh_db / 20);
+  thr_off = thr_on * 10 ^ (-hyst_db / 20);
+  thr_rearm = thr_on * 10 ^ (hyst_db / 20);
+  retrig_samples = max(1, floor(retrig_ms * 0.001 * srate));
+  rel_coef = exp(-1 / max(1, rel_ms * 0.001 * srate));
+  mask_coef = exp(-1 / max(1, mask_ms * 0.001 * srate));
+  confirm_samples = floor(confirm_ms * 0.001 * srate);
+  look_samples = min(floor(0.005 * srate), HIST_LEN - 2);
+  quiet_samples = max(1, floor(0.001 * srate));
+  floor_level = thr_on * 0.25;
+
+  hp_on = hp_hz > 0 && hp_hz < srate * 0.45;
+  hp_on ? (
+    w = 2 * $pi * hp_hz / srate;
+    a = sin(w) / (2 * 0.7071);
+    n = 1 / (1 + a);
+    hp_b0 = (1 + cos(w)) * 0.5 * n;
+    hp_b1 = -(1 + cos(w)) * n;
+    hp_b2 = hp_b0;
+    hp_a1 = -2 * cos(w) * n;
+    hp_a2 = (1 - a) * n;
+  );
+  lp_on = lp_hz > 0 && lp_hz < srate * 0.45;
+  lp_on ? (
+    w = 2 * $pi * lp_hz / srate;
+    a = sin(w) / (2 * 0.7071);
+    n = 1 / (1 + a);
+    lp_b0 = (1 - cos(w)) * 0.5 * n;
+    lp_b1 = (1 - cos(w)) * n;
+    lp_b2 = lp_b0;
+    lp_a1 = -2 * cos(w) * n;
+    lp_a2 = (1 - a) * n;
+  );
+  st_burst_coef = exp(-1 / max(1, 0.005 * srate));
+  st_valid = 0;
+  coeff_srate = srate;
+);
+
+// Commit protocol: mark the record -seq, write the fields, mark it +seq, then
+// advance the lane head. Readers check the marker before and after copying.
+function publish(kind, a, b, c, d, e) local(s, rb)
+(
+  is_owner ? (
+    s = seq + 1;
+    rb = lane_base + RING_OFFSET + ((s - 1) % RING_SIZE) * RECORD_SIZE;
+    gmem[rb + R_COMMIT] = -s;
+    gmem[rb + R_A] = a;
+    gmem[rb + R_B] = b;
+    gmem[rb + R_C] = c;
+    gmem[rb + R_SEG] = segment;
+    gmem[rb + R_KIND] = kind;
+    gmem[rb + R_D] = d;
+    gmem[rb + R_E] = e;
+    gmem[rb + R_COMMIT] = s;
+    seq = s;
+    gmem[lane_base + H_SEQ] = s;
+  );
+);
+
+// Finish the attack in progress: the peak so far is good enough. Called before
+// anything that would otherwise publish out of order.
+function fire_hit()
+(
+  pending ? (
+    pending = 0;
+    mask = pk;
+    is_owner ? (
+      gmem[lane_base + H_LAST_PEAK] = pk;
+      gmem[lane_base + H_TRIGGER_TOTAL] += 1;
+    );
+    hit_playing ? (
+      publish(KIND_HIT, hit_s, hit_qn, pk, hit_offset, hit_back);
+      is_owner ? gmem[lane_base + H_LAST_QN] = hit_qn;
+    ) : (
+      is_owner ? gmem[lane_base + H_IDLE_TRIGGERS] += 1;
+    );
+    trigger_led = 1;
+    last_peak_ui = pk;
+  );
+);
+
+function start_segment(pos_s, pos_qn, prev_s, prev_qn, continuous)
+(
+  segment += 1;
+  publish(KIND_SEG_START, pos_s, pos_qn, prev_s, prev_qn, continuous);
+  st_valid = 0;
+);
+
+function take_ownership()
+(
+  is_owner = 1;
+  // Sequence and segment continue from shared memory: both stay monotonic
+  // across instance reloads, so readers never see a head that went backwards.
+  seq = gmem[lane_base + H_SEQ];
+  segment = gmem[lane_base + H_SEGMENT];
+  gmem[lane_base + H_OWNER] = my_id;
+  force_segment = 1;
+);
+
+// One writer per lane. A second instance on the same lane stands down (higher
+// id yields), reports the conflict, and takes over only once the owner stops.
+function manage_ownership() local(other, other_hb)
+(
+  other = gmem[lane_base + H_OWNER];
+  other_hb = gmem[lane_base + H_HEARTBEAT];
+  is_owner ? (
+    other !== my_id && other !== 0 && my_id > other ? is_owner = 0;
+    is_owner ? (
+      gmem[lane_base + H_OWNER] = my_id;
+      gmem[lane_base + H_DUPLICATE] > 0 ? gmem[lane_base + H_DUPLICATE] = max(0, gmem[lane_base + H_DUPLICATE] - samplesblock);
+    );
+    stale_blocks = 0;
+    last_other_hb = -1;
+  ) : (
+    other === 0 ? (
+      take_ownership();
+    ) : (
+      other_hb === last_other_hb ? stale_blocks += 1 : stale_blocks = 0;
+      last_other_hb = other_hb;
+      stale_blocks * samplesblock >= srate * 0.25 && stale_blocks >= 4 ? (
+        take_ownership();
+      ) : (
+        other !== my_id ? gmem[lane_base + H_DUPLICATE] = srate * 0.25; // samples until it lapses
+      );
+    );
+  );
+);
+
+@slider
+calc_coeffs();
+
+@block
+srate !== coeff_srate ? calc_coeffs();
+
+want_lane = max(0, min(7, floor(lane_ui + 0.5) - 1));
+want_lane !== lane_idx ? (
+  lane_idx = want_lane;
+  lane_base = GLOBAL_SIZE + lane_idx * LANE_STRIDE;
+  pending = 0;
+  is_owner = 0;
+  stale_blocks = 0;
+  last_other_hb = -1;
+  gmem[G_MAGIC] = PR_MAGIC;
+  gmem[G_VERSION] = PR_VERSION;
+);
+
+manage_ownership();
+
+spos = 0;
+qn_per_sample = tempo / (60 * srate);
+playing = play_state > 0 && (play_state & 1) === 1;
+
+// Transport: a position that doesn't follow from the previous block is a seek or
+// loop wrap, and starts a new segment. The tolerance tolerates non-unity playrate
+// so it doesn't produce a segment per block; the UI refuses to score those.
+playing ? (
+  !was_playing || force_segment ? (
+    fire_hit();
+    start_segment(play_position, beat_position, 0, 0, 0);
+    force_segment = 0;
+  ) : (
+    expect_s = prev_s + prev_block / srate;
+    abs(play_position - expect_s) > 0.001 + 0.25 * prev_block / srate ? (
+      fire_hit();
+      start_segment(play_position, beat_position,
+                    expect_s, prev_qn + prev_block * prev_qn_per_sample, 1);
+    );
+  );
+  prev_s = play_position;
+  prev_qn = beat_position;
+  prev_block = samplesblock;
+  prev_qn_per_sample = qn_per_sample;
+) : (
+  was_playing ? (
+    fire_hit();
+    publish(KIND_SEG_END, prev_s + prev_block / srate,
+            prev_qn + prev_block * prev_qn_per_sample, 0, 0, 0);
+  );
+  force_segment = 0;
+);
+was_playing = playing;
+
+// Per-block status, guarded by a seqlock on the heartbeat
+is_owner ? (
+  gmem[lane_base + H_HEARTBEAT] = heartbeat = floor(gmem[lane_base + H_HEARTBEAT] * 0.5) * 2 + 1;
+  gmem[lane_base + H_LEVEL] = level_max;
+  gmem[lane_base + H_SEGMENT] = segment;
+  gmem[lane_base + H_BLOCK_S] = play_position;
+  gmem[lane_base + H_BLOCK_QN] = beat_position;
+  gmem[lane_base + H_PLAY_STATE] = play_state;
+  gmem[lane_base + H_TEMPO] = tempo;
+  gmem[lane_base + H_TS_NUM] = ts_num;
+  gmem[lane_base + H_TS_DENOM] = ts_denom;
+  gmem[lane_base + H_SRATE] = srate;
+  gmem[lane_base + H_SAMPLESBLOCK] = samplesblock;
+  gmem[lane_base + H_THRESHOLD] = thr_on;
+  gmem[lane_base + H_SELFTEST] = st_mode;
+  gmem[lane_base + H_HEARTBEAT] = heartbeat + 1;
+);
+level_ui = level_max;
+level_max = 0;
+
+// Self-test schedule: pulses are placed by the transport clock, then run through
+// the same detector as real audio.
+st_mode > 0 && playing ? (
+  st_mode === 1 ? (st_int = 2; st_ph = 0);
+  st_mode === 2 ? (st_int = 2; st_ph = 1);
+  st_mode === 3 ? (st_int = 0.5; st_ph = 0);
+  st_off_qn = st_offset * tempo / 60000;
+  !st_valid || st_mode !== st_mode_prev || st_offset !== st_offset_prev ? (
+    st_next = st_ph + st_off_qn + ceil((beat_position - st_ph - st_off_qn) / st_int) * st_int;
+    st_valid = 1;
+  );
+  st_mode_prev = st_mode;
+  st_offset_prev = st_offset;
+) : (
+  st_valid = 0;
+);
+
+@sample
+x = ch_sel === 0 ? spl0 : (ch_sel === 1 ? spl1 : (spl0 + spl1) * 0.5);
+
+st_valid ? (
+  beat_position + spos * qn_per_sample >= st_next ? (
+    st_burst = 0.5;
+    st_next += st_int;
+  );
+  st_burst > 0.00001 ? (
+    x += st_burst;
+    st_burst *= st_burst_coef;
+  ) : st_burst = 0;
+);
+
+hp_on ? (
+  y = hp_b0 * x + hp_z1;
+  hp_z1 = hp_b1 * x - hp_a1 * y + hp_z2;
+  hp_z2 = hp_b2 * x - hp_a2 * y;
+  x = y;
+);
+lp_on ? (
+  y = lp_b0 * x + lp_z1;
+  lp_z1 = lp_b1 * x - lp_a1 * y + lp_z2;
+  lp_z2 = lp_b2 * x - lp_a2 * y;
+  x = y;
+);
+
+r = abs(x);
+hist[hist_w] = r;
+hist_w += 1;
+hist_w >= HIST_LEN ? hist_w = 0;
+
+r > env ? env = r : (
+  env *= rel_coef;
+  env < 0.0000000001 ? env = 0;
+);
+env > level_max ? level_max = env;
+
+mask *= mask_coef;
+mask < 0.0000000001 ? mask = 0;
+since += 1;
+
+pending ? (
+  r > pk ? pk = r;
+  confirm_left -= 1;
+  confirm_left <= 0 ? fire_hit();
+) : (
+  env < thr_off ? armed = 1;
+  env > thr_on ? (
+    since < retrig_samples ? (
+      armed = 0; // consumed by retrigger suppression; must fall below to re-arm
+    ) : (
+      armed || env > max(mask, thr_rearm) ? (
+        // Backdate to the first sample above the floor, but only if a quiet run
+        // precedes it. Otherwise the crossing itself is the honest answer.
+        back = 0;
+        backdate_on ? (
+          i = 1;
+          run = 0;
+          cand = 0;
+          while (i <= look_samples && run < quiet_samples) (
+            v = hist[(hist_w - 1 - i + HIST_LEN) % HIST_LEN];
+            v < floor_level ? run += 1 : (
+              run = 0;
+              cand = i;
+            );
+            i += 1;
+          );
+          run >= quiet_samples ? back = cand;
+        );
+        hit_offset = spos - back;
+        hit_back = back;
+        hit_s = play_position + hit_offset / srate;
+        hit_qn = beat_position + hit_offset * qn_per_sample;
+        hit_playing = playing;
+        pk = r;
+        pending = 1;
+        armed = 0;
+        since = 0;
+        confirm_left = confirm_samples;
+        confirm_left <= 0 ? fire_hit();
+      );
+    );
+  );
+);
+
+spos += 1;
+
+@gfx 460 110
+gfx_r = 0.09; gfx_g = 0.09; gfx_b = 0.1; gfx_a = 1;
+gfx_x = gfx_y = 0;
+gfx_rectto(gfx_w, gfx_h);
+
+gfx_x = 10; gfx_y = 8;
+gfx_r = gfx_g = gfx_b = 0.9;
+gfx_printf("Lane %d  ", lane_idx + 1);
+is_owner ? (
+  gfx_r = 0.5; gfx_g = 0.9; gfx_b = 0.5;
+  gfx_drawstr("publishing");
+) : (
+  gfx_r = 1; gfx_g = 0.45; gfx_b = 0.35;
+  gfx_drawstr("STANDING BY: another instance owns this lane");
+);
+st_mode > 0 ? (
+  gfx_x = 10; gfx_y = 26;
+  gfx_r = 1; gfx_g = 0.8; gfx_b = 0.3;
+  gfx_printf("SELF-TEST ACTIVE  offset %+.1f ms", st_offset);
+);
+
+// level meter on a -70..0 dB scale
+meter_x = 10; meter_y = 50; meter_w = gfx_w - 60; meter_h = 18;
+gfx_r = gfx_g = gfx_b = 0.22;
+gfx_x = meter_x; gfx_y = meter_y;
+gfx_rectto(meter_x + meter_w, meter_y + meter_h);
+db = level_ui > 0.0000001 ? 20 * log10(level_ui) : -70;
+frac = max(0, min(1, (db + 70) / 70));
+gfx_r = 0.35; gfx_g = 0.75; gfx_b = 0.4;
+gfx_x = meter_x; gfx_y = meter_y;
+gfx_rectto(meter_x + meter_w * frac, meter_y + meter_h);
+gfx_r = 1; gfx_g = 0.3; gfx_b = 0.3;
+tx = meter_x + meter_w * (thresh_db + 70) / 70;
+gfx_line(tx, meter_y - 3, tx, meter_y + meter_h + 3);
+
+// trigger LED
+trigger_led > 0 ? (
+  gfx_r = 1; gfx_g = 0.75; gfx_b = 0.2;
+  trigger_led = max(0, trigger_led - 0.12);
+) : (
+  gfx_r = gfx_g = gfx_b = 0.25;
+);
+gfx_x = gfx_w - 40; gfx_y = meter_y;
+gfx_rectto(gfx_w - 10, meter_y + meter_h);
+
+gfx_r = gfx_g = gfx_b = 0.65;
+gfx_x = 10; gfx_y = 78;
+gfx_printf("Input %.1f dB   threshold %.1f dB   last peak %.1f dB", db, thresh_db,
+           last_peak_ui > 0.0000001 ? 20 * log10(last_peak_ui) : -120);

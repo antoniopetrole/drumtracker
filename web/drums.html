@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#121316">
+<title>Drum Timing</title>
+<style>
+  :root {
+    --bg: #121316;
+    --card: #1c1e23;
+    --plot: #121316;
+    --line: #3a3f47;
+    --ink: #eceef2;
+    --ink-2: #a9aeb8;
+    --ink-3: #7d828c;
+    --good: #63d471;
+    --warn: #f2b84b;
+    --bad: #f0605a;
+    --band: rgba(99, 212, 113, 0.16);
+    --button: #2b2e35;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) 12px calc(76px + env(safe-area-inset-bottom));
+    -webkit-tap-highlight-color: transparent;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+    padding: 10px 2px; color: var(--ink-2); font-variant-numeric: tabular-nums;
+  }
+  #conn { font-weight: 600; color: var(--ink); }
+  #conn::before {
+    content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    margin-right: 6px; background: var(--dot, var(--ink-3));
+  }
+  .banner {
+    margin: 0 0 8px; padding: 8px 10px; border-radius: 8px;
+    background: var(--card); border-left: 4px solid var(--warn); color: var(--ink);
+  }
+  .banner.bad { border-left-color: var(--bad); color: var(--ink); }
+  .banner[hidden] { display: none; }
+  #lanes {
+    display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  }
+  .lane { background: var(--card); border-radius: 12px; padding: 10px 12px 12px; min-width: 0; }
+  .top { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-weight: 600; }
+  .swatch { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+  .meter { flex: 1; height: 8px; background: var(--plot); border-radius: 4px; position: relative; overflow: hidden; min-width: 40px; }
+  .meter i { position: absolute; inset: 0 auto 0 0; background: var(--ink-3); width: 0; }
+  .meter i.hot { background: var(--warn); }
+  .meter b { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); opacity: 0.8; }
+  .readout { display: flex; align-items: baseline; gap: 10px; margin: 2px 0 6px; min-height: 66px; }
+  .value { font-size: 54px; font-weight: 700; line-height: 1.2; letter-spacing: -1px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .word { font-size: 16px; font-weight: 700; }
+  .message { color: var(--ink-3); font-size: 14px; align-self: center; }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); } .none { color: var(--ink-3); }
+  canvas { display: block; width: 100%; height: 58px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .stats div { min-width: 0; }
+  .stats span { display: block; color: var(--ink-3); font-size: 12px; }
+  .stats strong { font-size: 17px; font-weight: 600; white-space: nowrap; }
+  nav {
+    position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 8px;
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+    background: var(--bg); border-top: 1px solid var(--line);
+  }
+  button {
+    flex: 1; height: 52px; border: 0; border-radius: 10px;
+    background: var(--button); color: var(--ink); font: 600 17px system-ui, sans-serif; touch-action: manipulation;
+  }
+  button:active { filter: brightness(1.4); }
+  button:disabled { opacity: 0.4; }
+  button.armed { background: var(--warn); color: #121316; }
+  /* Phone portrait: every drum on screen at once, since nobody scrolls mid-groove. */
+  @media (max-width: 600px) and (orientation: portrait) {
+    header { padding: 6px 2px; gap: 2px 10px; font-size: 13px; }
+    .banner { margin-bottom: 5px; padding: 4px 8px; font-size: 12px; }
+    #selftest, #uncal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #lanes { gap: 6px; }
+    .lane { padding: 6px 10px 8px; }
+    .readout { min-height: 46px; margin: 0 0 2px; }
+    .value { font-size: 38px; }
+    .word { font-size: 14px; }
+    canvas { height: 46px; }
+    .stats { margin-top: 4px; }
+    .stats span { font-size: 11px; }
+    .stats strong { font-size: 15px; }
+    button { height: 46px; }
+    body { padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
+  }
+  @media (max-height: 520px) and (orientation: landscape) {
+    .readout { min-height: 44px; margin: 0 0 2px; } .value { font-size: 36px; }
+    canvas { height: 40px; } .stats strong { font-size: 15px; }
+    button { height: 40px; } body { padding-bottom: 60px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span id="conn">Connecting</span>
+  <span id="transport"></span>
+  <span id="position"></span>
+  <span id="click"></span>
+</header>
+<div id="problem" class="banner bad" role="alert" hidden></div>
+<div id="selftest" class="banner" hidden></div>
+<div id="uncal" class="banner" hidden></div>
+<main id="lanes"></main>
+<nav>
+  <button id="play" type="button">Play</button>
+  <button id="stop" type="button">Stop</button>
+  <button id="reset" type="button">Reset</button>
+</nav>
+<script>
+"use strict";
+var SECTION = "LiveDrumGrooveMonitor";
+var POLL_MS = 100;
+var TIMEOUT_MS = 2000;
+var STALE_MS = 2500;      // no new snapshot for this long: the dashboard isn't running
+var CMD_PLAY = 1007, CMD_STOP = 1016;
+
+var cards = {};
+var lastSeq = null, lastSeqAt = 0, snapshot = null, reachable = false;
+var flashAt = {}, seenTriggers = {};
+
+function el(id) { return document.getElementById(id); }
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+var C = { plot: css("--plot"), line: css("--line"), ink: css("--ink"), ink3: css("--ink-3"), band: css("--band"), bad: css("--bad") };
+
+// Tab-delimited reply, with \t \n and \\ escaped inside strings.
+function parseExtState(text) {
+  var line = text.split("\n")[0];
+  var parts = line.split("\t");
+  if (parts[0] !== "EXTSTATE" || parts.length < 4) return null;
+  return parts.slice(3).join("\t")
+    .replace(/\\t/g, "\t").replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+}
+
+function request(path, timeout) {
+  var ctrl = new AbortController();
+  var timer = setTimeout(function () { ctrl.abort(); }, timeout || TIMEOUT_MS);
+  return fetch("/_/" + path, { signal: ctrl.signal, cache: "no-store" }).then(function (r) {
+    clearTimeout(timer);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.text();
+  }).catch(function (e) { clearTimeout(timer); throw e; });
+}
+
+function poll() {
+  request("GET/EXTSTATE/" + SECTION + "/snapshot").then(function (text) {
+    reachable = true;
+    var raw = parseExtState(text);
+    if (raw) {
+      var data = JSON.parse(raw);
+      if (data.seq !== lastSeq) { lastSeq = data.seq; lastSeqAt = Date.now(); }
+      snapshot = data;
+    } else {
+      snapshot = null;
+    }
+  }).catch(function () {
+    reachable = false;
+  }).then(function () {
+    render();
+    setTimeout(poll, POLL_MS);
+  });
+}
+
+function dashboardLive() {
+  return reachable && snapshot && Date.now() - lastSeqAt < STALE_MS;
+}
+
+function fmtMs(v) {
+  if (v === null || v === undefined) return "--";
+  var r = Math.round(v * 10) / 10;
+  if (r === 0) return "0.0 ms";
+  return (r > 0 ? "+" : "") + r.toFixed(1) + " ms";
+}
+function fmtUnsigned(v) { return v === null || v === undefined ? "--" : v.toFixed(1) + " ms"; }
+
+function makeCard(lane) {
+  var root = document.createElement("section");
+  root.className = "lane";
+  root.innerHTML =
+    '<div class="top"><span class="swatch"></span><span class="name"></span>' +
+    '<div class="meter"><i></i><b></b></div></div>' +
+    '<div class="readout"><span class="value"></span><span class="word"></span><span class="message"></span></div>' +
+    '<canvas aria-hidden="true"></canvas>' +
+    '<div class="stats">' +
+    '<div><span>Bias</span><strong class="bias"></strong></div>' +
+    '<div><span>Spread</span><strong class="spread"></strong></div>' +
+    '<div><span>Miss</span><strong class="misses"></strong></div>' +
+    '<div><span>Extra</span><strong class="extras"></strong></div>' +
+    '</div>';
+  el("lanes").appendChild(root);
+  var q = function (s) { return root.querySelector(s); };
+  return {
+    root: root, swatch: q(".swatch"), name: q(".name"), level: q(".meter i"), thr: q(".meter b"),
+    value: q(".value"), word: q(".word"), message: q(".message"), canvas: q("canvas"),
+    bias: q(".bias"), spread: q(".spread"), misses: q(".misses"), extras: q(".extras"),
+  };
+}
+
+function hexAlpha(hex, alpha) {
+  var n = parseInt(hex.slice(1), 16);
+  return "rgba(" + (n >> 16) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + alpha + ")";
+}
+
+// One strip per drum. Dots are hits (newest brightest and largest), the tall tick
+// is bias and the bar is +/- one standard deviation: position and width, so
+// neither depends on seeing the colour.
+function drawStrip(card, lane, data) {
+  var c = card.canvas, dpr = window.devicePixelRatio || 1;
+  var w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  var g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+
+  var axisH = 15, plotH = h - axisH, pad = 8, range = data.range;
+  var x = function (ms) {
+    var v = Math.max(-range, Math.min(range, ms));
+    return pad + (v + range) / (2 * range) * (w - 2 * pad);
+  };
+
+  g.fillStyle = C.plot;
+  g.fillRect(0, 0, w, plotH);
+  g.fillStyle = C.band;
+  g.fillRect(x(-data.tolerance), 0, x(data.tolerance) - x(-data.tolerance), plotH);
+
+  g.font = "11px system-ui, sans-serif";
+  g.textAlign = "center";
+  g.textBaseline = "top";
+  var tick = range > 60 ? 40 : 20;
+  for (var v = -Math.floor(range / tick) * tick; v <= range; v += tick) {
+    g.fillStyle = v === 0 ? C.ink : C.line;
+    g.fillRect(Math.round(x(v)) - (v === 0 ? 1 : 0), 0, v === 0 ? 2 : 1, plotH);
+    g.fillStyle = C.ink3;
+    g.fillText(v === 0 ? "0" : (v > 0 ? "+" : "") + v, x(v), plotH + 2);
+  }
+
+  var mid = plotH / 2;
+  if (lane.bias !== null && lane.bias !== undefined) {
+    if (lane.spread !== null && lane.spread !== undefined) {
+      g.fillStyle = hexAlpha(lane.color, 0.3);
+      var left = x(lane.bias - lane.spread);
+      g.fillRect(left, mid - 5, Math.max(2, x(lane.bias + lane.spread) - left), 10);
+    }
+    g.fillStyle = lane.color;
+    g.fillRect(x(lane.bias) - 1.5, 2, 3, plotH - 4);
+  }
+
+  var pts = lane.points, n = pts.length;
+  for (var i = 0; i < n; i++) {
+    var newest = i === n - 1;
+    var off = Math.abs(pts[i]) > range;
+    g.beginPath();
+    g.arc(x(pts[i]), mid, newest ? 6 : 4, 0, Math.PI * 2);
+    g.fillStyle = off ? C.bad : hexAlpha(lane.color, newest ? 1 : 0.2 + 0.55 * (i + 1) / n);
+    g.fill();
+    if (newest) { g.lineWidth = 2; g.strokeStyle = C.plot; g.stroke(); }
+  }
+}
+
+function renderLane(lane, data) {
+  var card = cards[lane.index];
+  card.swatch.style.background = lane.color;
+  card.name.textContent = lane.name + (lane.scoring ? "" : " (muted)");
+
+  if (seenTriggers[lane.index] !== lane.triggers) {
+    seenTriggers[lane.index] = lane.triggers;
+    flashAt[lane.index] = Date.now();
+  }
+  var hasLevel = lane.level !== null && lane.level !== undefined;
+  card.level.style.width = (hasLevel ? lane.level * 100 : 0) + "%";
+  card.level.className = Date.now() - (flashAt[lane.index] || 0) < 150 ? "hot" : "";
+  card.thr.style.left = (hasLevel ? lane.threshold * 100 : 0) + "%";
+  card.thr.style.display = hasLevel ? "" : "none";
+
+  var message = lane.message;
+  if (!message && !lane.latest) {
+    message = lane.detected > 0 ? "Hits arriving, none on pattern yet" : "Waiting for hits";
+  }
+
+  if (lane.latest) {
+    var ms = Math.abs(lane.latest.ms);
+    var cls = lane.latest.word === "ON TIME" ? "good" : ms > data.tolerance ? "bad" : "warn";
+    card.value.textContent = lane.latest.text;
+    card.value.className = "value " + cls;
+    card.word.textContent = lane.latest.word;
+    card.word.className = "word " + cls;
+  } else {
+    card.value.textContent = "--";
+    card.value.className = "value none";
+    card.word.textContent = "";
+  }
+  card.message.textContent = lane.latest && lane.state === "live" ? "" : message || "";
+  card.message.className = "message" + (lane.state === "bad" ? " bad" : "");
+
+  card.bias.textContent = fmtMs(lane.bias);
+  card.spread.textContent = fmtUnsigned(lane.spread);
+  card.misses.textContent = lane.misses;
+  card.extras.textContent = lane.extras;
+  drawStrip(card, lane, data);
+}
+
+function setBanner(id, text) {
+  var b = el(id);
+  b.hidden = !text;
+  b.textContent = text || "";
+}
+
+function render() {
+  var live = dashboardLive();
+  var dot = el("conn");
+  var data = snapshot;
+
+  if (!reachable) {
+    dot.textContent = "Can't reach REAPER";
+    dot.style.setProperty("--dot", css("--bad"));
+    setBanner("problem", "Can't reach REAPER. Is it running, on the same Wi-Fi as this device?");
+  } else if (!live) {
+    dot.textContent = "Dashboard closed";
+    dot.style.setProperty("--dot", css("--warn"));
+    setBanner("problem", "Open Live Drum Groove Monitor on the PC. It does the scoring, and this page shows its results.");
+  } else {
+    dot.textContent = data.detectors + " detector" + (data.detectors === 1 ? "" : "s");
+    dot.style.setProperty("--dot", data.detectors > 0 ? css("--good") : css("--warn"));
+    if (!data.project_ok) setBanner("problem", "Not scoring: " + data.project_reason);
+    else if (!data.scoring_enabled) setBanner("problem", "Scoring is off on the PC.");
+    else setBanner("problem", "");
+  }
+
+  el("reset").disabled = !live;
+
+  // Without a live dashboard the numbers aren't current, so don't show any.
+  if (!live) {
+    el("transport").textContent = "";
+    el("position").textContent = "";
+    el("click").textContent = "";
+    setBanner("selftest", "");
+    setBanner("uncal", "");
+    Object.keys(cards).forEach(function (k) { cards[k].root.remove(); delete cards[k]; });
+    return;
+  }
+
+  el("transport").textContent = data.transport;
+  el("position").textContent = (data.bpm ? data.bpm.toFixed(1) + " BPM  " : "") +
+    "Bar " + data.bar + "." + Math.floor(data.beat);
+  el("click").textContent = data.metronome ? "Click on" : "Click off";
+
+  setBanner("selftest", data.selftest.length
+    ? "Self-test active, not real hits: " + data.selftest.join(", ") : "");
+  setBanner("uncal", data.uncalibrated.length
+    ? "Uncalibrated: bias includes latency. Spread is valid." : "");
+
+  // Create every card before drawing any, so plots measure their final width.
+  var present = {};
+  data.lanes.forEach(function (lane) {
+    present[lane.index] = true;
+    if (!cards[lane.index]) cards[lane.index] = makeCard(lane);
+  });
+  data.lanes.forEach(function (lane) { renderLane(lane, data); });
+  Object.keys(cards).forEach(function (k) {
+    if (!present[k]) { cards[k].root.remove(); delete cards[k]; }
+  });
+}
+
+function send(command) {
+  return request(String(command)).catch(function () {});
+}
+
+el("play").addEventListener("click", function () { send(CMD_PLAY); });
+el("stop").addEventListener("click", function () { send(CMD_STOP); });
+
+// A stray tap with a stick shouldn't wipe a session: Reset needs a second tap.
+var resetTimer = null;
+el("reset").addEventListener("click", function () {
+  var b = el("reset");
+  if (resetTimer) {
+    clearTimeout(resetTimer);
+    resetTimer = null;
+    b.classList.remove("armed");
+    b.textContent = "Reset";
+    send("SET/EXTSTATE/" + SECTION + "/command/reset");
+    return;
+  }
+  b.classList.add("armed");
+  b.textContent = "Tap again";
+  resetTimer = setTimeout(function () {
+    resetTimer = null;
+    b.classList.remove("armed");
+    b.textContent = "Reset";
+  }, 3000);
+});
+
+// Keeps the screen on where the browser allows it. Browsers only offer this on
+// HTTPS, so on plain HTTP it usually does nothing: see the README.
+function keepAwake() {
+  try {
+    if (navigator.wakeLock && document.visibilityState === "visible") {
+      navigator.wakeLock.request("screen").catch(function () {});
+    }
+  } catch (e) {}
+}
+document.addEventListener("visibilitychange", keepAwake);
+keepAwake();
+
+window.addEventListener("resize", render);
+poll();
+</script>
+</body>
+</html>
