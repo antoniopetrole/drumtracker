@@ -69,4 +69,35 @@ function M.compute(entries)
   return result
 end
 
+-- Accent/ghost dynamics in dB relative to full scale at the detector. The gap
+-- between them doesn't depend on mic gain. Undefined values stay nil, as above.
+-- A clipped accent reads quieter than it was, so the gap would be understated.
+function M.dynamics(entries)
+  local function group(level)
+    local sum, n, clipped = 0, 0, 0
+    for _, e in ipairs(entries) do
+      if e.level == level then
+        sum = sum + e.peak_db
+        n = n + 1
+        if e.clipped then clipped = clipped + 1 end
+      end
+    end
+    local out = { n = n, clipped = clipped }
+    if n == 0 then return out end
+    out.mean = sum / n
+    if n >= 2 then
+      local ss = 0
+      for _, e in ipairs(entries) do
+        if e.level == level then ss = ss + (e.peak_db - out.mean) ^ 2 end
+      end
+      out.sd = math.sqrt(ss / (n - 1))
+    end
+    return out
+  end
+  local accent, ghost = group("accent"), group("ghost")
+  local gap
+  if accent.mean and ghost.mean then gap = accent.mean - ghost.mean end
+  return { accent = accent, ghost = ghost, gap = gap }
+end
+
 return M

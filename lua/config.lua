@@ -3,6 +3,7 @@
 -- and then validated field by field, so a bad value falls back, not crashes.
 
 local Patterns = require("patterns")
+local Library = require("library")
 
 local C = {}
 
@@ -23,6 +24,8 @@ function C.defaults()
     on_time_ms = 5,
     origin_bar = 1,
     scoring_enabled = true,
+    rudiment_lane = 2,
+    active_pattern = { id = "groove:rock", name = "Rock beat" },
     lanes = {},
   }
   for i = 1, 8 do
@@ -33,6 +36,8 @@ function C.defaults()
     cfg.lanes[i] = {
       name = DEFAULT_NAMES[i],
       steps = steps,
+      accents = {},
+      ghosts = {},
       scoring = i <= 3,
       calibration_ms = 0,
       calibrated = false, -- set once the user applies a calibration on purpose
@@ -61,6 +66,16 @@ function C.sanitize(raw)
   d.on_time_ms = num(raw.on_time_ms, 0, 50, d.on_time_ms)
   d.origin_bar = math.floor(num(raw.origin_bar, 1, 100000, d.origin_bar))
   if type(raw.scoring_enabled) == "boolean" then d.scoring_enabled = raw.scoring_enabled end
+  d.rudiment_lane = math.floor(num(raw.rudiment_lane, 1, 8, d.rudiment_lane))
+
+  -- No record of what's on the grid: say so rather than claim the default.
+  d.active_pattern = { name = "Custom" }
+  local ap = raw.active_pattern
+  if type(ap) == "table" and type(ap.name) == "string" and #ap.name > 0 then
+    d.active_pattern = { name = ap.name:sub(1, 32), modified = ap.modified == true }
+    if type(ap.id) == "string" then d.active_pattern.id = ap.id end
+    if Library.valid_sticking(ap.sticking) then d.active_pattern.sticking = ap.sticking end
+  end
 
   if type(raw.lanes) == "table" then
     for i = 1, 8 do
@@ -80,6 +95,8 @@ function C.sanitize(raw)
           end
           dst.steps = Patterns.to_steps(p)
         end
+        dst.accents = Library.clean_steps(src.accents, dst.steps)
+        dst.ghosts = Library.clean_steps(src.ghosts, dst.steps)
       end
     end
   end
@@ -123,7 +140,8 @@ function C.encode(cfg)
     .. serialize(cfg, "") .. "\n"
 end
 
-function C.decode(text)
+-- Reads a settings-format file into a plain value, with nothing validated yet.
+function C.parse(text)
   if type(text) ~= "string" or text:sub(1, 1) == "\27" then
     return nil, "not a settings file"
   end
@@ -131,6 +149,12 @@ function C.decode(text)
   if not chunk then return nil, err end
   local ok, value = pcall(chunk)
   if not ok then return nil, value end
+  return value
+end
+
+function C.decode(text)
+  local value, err = C.parse(text)
+  if value == nil then return nil, err end
   return C.sanitize(value)
 end
 

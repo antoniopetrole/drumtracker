@@ -14,10 +14,11 @@ slider6:rel_ms=25<2,200,1>Envelope release (ms)
 slider7:mask_ms=150<10,1000,5>Ring mask decay (ms)
 slider8:hp_hz=0<0,5000,10>Detection high-pass (Hz, 0=off)
 slider9:lp_hz=0<0,20000,50>Detection low-pass (Hz, 0=off)
-slider10:confirm_ms=2<0,10,0.5>Peak confirm window (ms)
+slider10:confirm_ms=5<0,10,0.5>Peak confirm window (ms)
 slider11:backdate_on=1<0,1,1{Off,On}>Backdate to first attack
-slider12:st_mode=0<0,3,1{Off,Beats 1+3 (kick),Beats 2+4 (snare),Eighths (hat)}>Self-test pulses (detector only, inaudible)
+slider12:st_mode=0<0,4,1{Off,Beats 1+3 (kick),Beats 2+4 (snare),Eighths (hat),16ths: accents on beats and ghosts}>Self-test pulses (detector only, inaudible)
 slider13:st_offset=0<-60,60,0.1>Self-test offset (ms)
+slider14:jump_db=6<0,24,0.5>Re-attack jump (dB, 0=off): lets a soft hit through on a ringing drum
 
 @init
 ext_noinit = 1;   // keep state across transport start; srate is checked in @block
@@ -83,6 +84,11 @@ hist = 0;
 HIST_LEN = 4096;
 hist_w = 0;
 
+// envelope as it was 2 ms ago, at up to 192 kHz: the re-attack reference
+env_hist = HIST_LEN;
+ENV_HIST_MAX = 512;
+env_hist_w = 0;
+
 lane_idx = -1; // forces homing in the first @block
 is_owner = 0;
 stale_blocks = 0;
@@ -119,6 +125,10 @@ function calc_coeffs()
   look_samples = min(floor(0.005 * srate), HIST_LEN - 2);
   quiet_samples = max(1, floor(0.001 * srate));
   floor_level = thr_on * 0.25;
+  jump_ratio = jump_db > 0 ? 10 ^ (jump_db / 20) : 0;
+  env_delay = min(ENV_HIST_MAX, max(1, floor(0.002 * srate)));
+  env_hist_w = 0;
+  memset(env_hist, 0, ENV_HIST_MAX);
 
   hp_on = hp_hz > 0 && hp_hz < srate * 0.45;
   hp_on ? (
@@ -317,6 +327,7 @@ st_mode > 0 && playing ? (
   st_mode === 1 ? (st_int = 2; st_ph = 0);
   st_mode === 2 ? (st_int = 2; st_ph = 1);
   st_mode === 3 ? (st_int = 0.5; st_ph = 0);
+  st_mode === 4 ? (st_int = 0.25; st_ph = 0);
   st_off_qn = st_offset * tempo / 60000;
   !st_valid || st_mode !== st_mode_prev || st_offset !== st_offset_prev ? (
     st_next = st_ph + st_off_qn + ceil((beat_position - st_ph - st_off_qn) / st_int) * st_int;
@@ -334,6 +345,8 @@ x = ch_sel === 0 ? spl0 : (ch_sel === 1 ? spl1 : (spl0 + spl1) * 0.5);
 st_valid ? (
   beat_position + spos * qn_per_sample >= st_next ? (
     st_burst = 0.5;
+    // -2 dBFS on beats and -20 dBFS between: a known 18 dB gap
+    st_mode === 4 ? st_burst = (floor((st_next - st_off_qn) * 4 + 0.5) % 4) === 0 ? 0.8 : 0.1;
     st_next += st_int;
   );
   st_burst > 0.00001 ? (
@@ -366,6 +379,11 @@ r > env ? env = r : (
 );
 env > level_max ? level_max = env;
 
+env_ago = env_hist[env_hist_w];
+env_hist[env_hist_w] = env;
+env_hist_w += 1;
+env_hist_w >= env_delay ? env_hist_w = 0;
+
 mask *= mask_coef;
 mask < 0.0000000001 ? mask = 0;
 since += 1;
@@ -380,7 +398,10 @@ pending ? (
     since < retrig_samples ? (
       armed = 0; // consumed by retrigger suppression; must fall below to re-arm
     ) : (
-      armed || env > max(mask, thr_rearm) ? (
+      // A new attack is a jump above where the envelope was 2 ms ago: it can't be
+      // the last sample's, which climbs along with the attack. The mask alone would
+      // hide a ghost note just after an accent, as it decays slower than the drum.
+      armed || env > max(mask, thr_rearm) || (jump_ratio > 0 && r > env_ago * jump_ratio) ? (
         // Backdate to the first sample above the floor, but only if a quiet run
         // precedes it. Otherwise the crossing itself is the honest answer.
         back = 0;

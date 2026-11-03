@@ -5,6 +5,7 @@ local Patterns = require("patterns")
 local Config = require("config")
 local Bridge = require("bridge")
 local Remote = require("remote")
+local Library = require("library")
 
 local UI = {}
 UI.__index = UI
@@ -59,6 +60,7 @@ function UI.new(ImGui, app)
   self.app = app
   self.ctx = ImGui.CreateContext(TITLE)
   self.preset_name = "my-kit"
+  self.groove_name = "My groove"
   self.message = nil
   self.flash = {}
   self.seen_triggers = {}
@@ -220,7 +222,7 @@ function UI:scatter()
     end
     if #points == 0 then
       local state, text = self:lane_state(lane)
-      if state == "live" then text = "Waiting for hits" end
+      if state == "live" then text = lc.scoring and "Waiting for hits" or "Not in this pattern" end
       if text then ImGui.DrawList_AddText(dl, plot_l + 8, mid - 8, C_DIM, text) end
     end
   end
@@ -283,6 +285,8 @@ function UI:lane_card(lane, width)
 
   if state ~= "live" then
     ImGui.TextColored(ctx, state == "bad" and C_BAD or C_DIM, text)
+  elseif not lc.scoring then
+    ImGui.TextColored(ctx, C_DIM, "Not in this pattern")
   elseif not lane.latest then
     ImGui.TextColored(ctx, C_DIM, lane.counts.detected > 0 and "Hits arriving, none on pattern yet" or "Waiting for hits")
   else
@@ -340,11 +344,139 @@ function UI:stats_table()
   ImGui.TextColored(ctx, C_DIM, "Bias: consistently early (-) or late (+). Spread: how tightly hits cluster. A steady laid-back snare has high bias and low spread.")
 end
 
+-- Dynamics -------------------------------------------------------------------
+
+local function fmt_db_value(v)
+  if v == nil then return "--" end
+  return string.format("%.1f dB", v)
+end
+
+local function fmt_sd_db(v)
+  if v == nil then return "--" end
+  return string.format("%.1f dB", v)
+end
+
+function UI:dynamics_table()
+  local ImGui, ctx = self.ImGui, self.ctx
+  local rows = {}
+  for _, lane in ipairs(self:visible_lanes()) do
+    local dyn = self.app.session:dynamics(lane)
+    if dyn then rows[#rows + 1] = { lane = lane, dyn = dyn } end
+  end
+  if #rows == 0 then return end
+
+  local flags = ImGui.TableFlags_RowBg | ImGui.TableFlags_BordersInnerH
+  if not ImGui.BeginTable(ctx, "dynamics", 8, flags) then return end
+  for _, name in ipairs({ "Dynamics", "Accent-ghost gap", "Accent level", "Accent spread", "Ghost level", "Ghost spread", "Ghosts missed", "Clipped" }) do
+    ImGui.TableSetupColumn(ctx, name)
+  end
+  ImGui.TableHeadersRow(ctx)
+  for _, row in ipairs(rows) do
+    local lc = self.app.config.lanes[row.lane.index]
+    ImGui.TableNextRow(ctx)
+    ImGui.TableNextColumn(ctx)
+    ImGui.TextColored(ctx, lc.color, lc.name)
+    local cells = {
+      fmt_db_value(row.dyn.gap),
+      fmt_db_value(row.dyn.accent.mean), fmt_sd_db(row.dyn.accent.sd),
+      fmt_db_value(row.dyn.ghost.mean), fmt_sd_db(row.dyn.ghost.sd),
+      tostring(row.lane.counts.ghost_misses),
+      tostring(row.dyn.accent.clipped + row.dyn.ghost.clipped),
+    }
+    for _, text in ipairs(cells) do
+      ImGui.TableNextColumn(ctx)
+      ImGui.Text(ctx, text)
+    end
+  end
+  ImGui.EndTable(ctx)
+  ImGui.TextColored(ctx, C_DIM, "Gap: how much louder accents are than ghosts at the mic. Unlike levels, it doesn't depend on mic gain.")
+end
+
 -- Pattern editor ------------------------------------------------------------
+
+function UI:pattern_picker()
+  local ImGui, ctx = self.ImGui, self.ctx
+  local cfg = self.app.config
+  local active = cfg.active_pattern
+
+  ImGui.SetNextItemWidth(ctx, 280)
+  local label = active.name .. (active.modified and " (edited)" or "")
+  if ImGui.BeginCombo(ctx, "Pattern", label) then
+    for _, group in ipairs(self.app.pattern_groups()) do
+      if #group.items > 0 then
+        ImGui.SeparatorText(ctx, group.title)
+        for _, item in ipairs(group.items) do
+          local selected = item.id == active.id and not active.modified
+          if ImGui.Selectable(ctx, item.name, selected) then
+            self.message = self.app.load_pattern(item.id)
+          end
+        end
+      end
+    end
+    ImGui.EndCombo(ctx)
+  end
+  if self.app.previous_pattern then
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, "Undo load") then self.message = self.app.undo_pattern() end
+  end
+  ImGui.SameLine(ctx)
+  ImGui.TextColored(ctx, C_DIM, "Loading a pattern resets the session stats.")
+
+  ImGui.SetNextItemWidth(ctx, 200)
+  local rv, name = ImGui.InputText(ctx, "##groovename", self.groove_name)
+  if rv then
+    self.groove_name = name
+    self.confirm_save = false
+  end
+  ImGui.SameLine(ctx)
+  local exists = self.app.has_user_groove(self.groove_name)
+  if ImGui.Button(ctx, self.confirm_save and "Overwrite it?" or "Save groove") then
+    if exists and not self.confirm_save then
+      self.confirm_save = true
+    else
+      self.message = self.app.save_groove(self.groove_name)
+      self.confirm_save = false
+    end
+  end
+  if ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, "Saves the grid below under this name. Calibration and thresholds aren't part of a groove.")
+  end
+  local user_name = active.id and active.id:match("^user:(.+)$")
+  if user_name then
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, self.confirm_delete and "Really delete?" or "Delete groove") then
+      if self.confirm_delete then
+        self.message = self.app.delete_groove(user_name)
+        self.confirm_delete = false
+      else
+        self.confirm_delete = true
+      end
+    end
+  else
+    self.confirm_delete = false
+  end
+end
+
+function UI:rudiment_lane()
+  local ImGui, ctx = self.ImGui, self.ctx
+  local cfg = self.app.config
+  local names = {}
+  for i = 1, 8 do names[i] = cfg.lanes[i].name end
+  ImGui.SetNextItemWidth(ctx, 130)
+  local rv, lane = ImGui.Combo(ctx, "Play it on", cfg.rudiment_lane - 1, table.concat(names, "\0") .. "\0")
+  if rv then self.app.set_rudiment_lane(lane + 1) end
+  ImGui.SameLine(ctx)
+  ImGui.TextColored(ctx, C_DIM, "Capitals are accents, lowercase are ghosts. Letters are the sticking.")
+end
 
 function UI:pattern_tab()
   local ImGui, ctx = self.ImGui, self.ctx
   local cfg = self.app.config
+  self:pattern_picker()
+  local sticking = cfg.active_pattern.sticking
+  if cfg.active_pattern.modified then sticking = nil end
+  if sticking then self:rudiment_lane() end
+  ImGui.Spacing(ctx)
   local beat_names = { "1", "e", "&", "a", "2", "e", "&", "a", "3", "e", "&", "a", "4", "e", "&", "a" }
   local size, gap = 26, 3
 
@@ -363,6 +495,7 @@ function UI:pattern_tab()
   for _, lane in ipairs(self:visible_lanes()) do
     local lc = cfg.lanes[lane.index]
     local p = Patterns.from_steps(lc.steps)
+    local levels = Library.level_map(lc)
     local changed = false
     ImGui.PushID(ctx, "pat" .. lane.index)
     local rv, score = ImGui.Checkbox(ctx, "##score", lc.scoring)
@@ -379,24 +512,30 @@ function UI:pattern_tab()
     ImGui.Dummy(ctx, 0, 0)
     for s = 0, Patterns.STEPS - 1 do
       ImGui.SameLine(ctx, 0, s == 0 and 8 or gap + (s % 4 == 0 and 6 or 0))
-      local base = p[s] and lc.color or (s % 4 == 0 and C_STEP_OFF_BEAT or C_STEP_OFF)
+      local on_alpha = levels[s] == "accent" and 0xFF or (levels[s] == "ghost" and 0x48 or 0xA0)
+      local base = p[s] and with_alpha(lc.color, on_alpha) or (s % 4 == 0 and C_STEP_OFF_BEAT or C_STEP_OFF)
       ImGui.PushStyleColor(ctx, ImGui.Col_Button, base)
       ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, p[s] and with_alpha(lc.color, 0xC8) or C_GRID)
       ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, lc.color)
-      if ImGui.Button(ctx, "##s" .. s, size, 22) then
-        p[s] = not p[s]
+      -- The mark says it without relying on the shade.
+      local mark = ""
+      if p[s] then
+        if sticking then mark = sticking:sub(s + 1, s + 1)
+        elseif levels[s] == "accent" then mark = ">"
+        elseif levels[s] == "ghost" then mark = "g" end
+      end
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, levels[s] == "ghost" and C_TEXT or 0x101114FF)
+      if ImGui.Button(ctx, mark .. "##s" .. s, size, 22) then
+        Library.cycle_step(lc, s)
         changed = true
       end
-      ImGui.PopStyleColor(ctx, 3)
+      ImGui.PopStyleColor(ctx, 4)
     end
-    if changed then
-      lc.steps = Patterns.to_steps(p)
-      self.app.config_changed()
-    end
+    if changed then self.app.pattern_edited() end
     ImGui.PopID(ctx)
   end
   ImGui.Spacing(ctx)
-  ImGui.TextColored(ctx, C_DIM, "One bar of 4/4 repeating. Changing a pattern restarts matching from the current position.")
+  ImGui.TextColored(ctx, C_DIM, "One bar of 4/4 repeating. Click a step to cycle: on, accent (>), ghost (g), off. Editing restarts matching from now.")
 end
 
 -- Settings ------------------------------------------------------------------
@@ -680,6 +819,13 @@ function UI:diagnostics_tab()
         inst.st_offset = off
         Bridge.set_param(inst, Bridge.PARAM_ST_OFFSET, off)
       end
+      ImGui.SameLine(ctx)
+      local rv3, dyn_on = ImGui.Checkbox(ctx, "accents + ghosts (18 dB gap)", inst.st_mode == 4)
+      if rv3 then
+        local mode = dyn_on and 4 or 0
+        inst.st_mode = mode
+        Bridge.set_param(inst, Bridge.PARAM_ST_MODE, mode)
+      end
       ImGui.PopID(ctx)
     end
   end
@@ -713,6 +859,7 @@ function UI:frame()
     self:lane_cards()
     ImGui.Spacing(ctx)
     self:stats_table()
+    self:dynamics_table()
     ImGui.Spacing(ctx)
     if ImGui.BeginTabBar(ctx, "tabs") then
       local tabs = {

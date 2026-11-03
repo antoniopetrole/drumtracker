@@ -38,12 +38,14 @@ local Config = require("config")
 local Metrics = require("metrics")
 local Bridge = require("bridge")
 local Remote = require("remote")
+local Library = require("library")
 local UI = require("ui")
 
 -- Settings live with the REAPER install, not a project: they describe your kit.
 local data_dir = reaper.GetResourcePath() .. "/Data/LiveDrumGrooveMonitor"
 local preset_dir = data_dir .. "/presets"
 local settings_path = data_dir .. "/settings.lua"
+local grooves_path = data_dir .. "/grooves.lua"
 reaper.RecursiveCreateDirectory(preset_dir, 0)
 
 local config = Config.load_file(settings_path) or Config.defaults()
@@ -70,6 +72,16 @@ local status = {
 }
 for i = 1, 8 do status.detectors[i] = {} end
 
+local function load_grooves()
+  local f = io.open(grooves_path, "r")
+  if not f then return {} end
+  local text = f:read("a")
+  f:close()
+  return Library.sanitize_user(Config.parse(text))
+end
+
+local user_grooves = load_grooves()
+
 local dirty = false
 local dirty_at = 0
 
@@ -84,6 +96,7 @@ local app = {
   status = status,
   now = now,
   mark_dirty = mark_dirty,
+  library_rev = 1,
 }
 
 function app.config_changed()
@@ -154,6 +167,87 @@ function app.create_tracks()
   return string.format("Added %d tracks. Check their inputs match your interface.", result)
 end
 
+function app.pattern_groups()
+  return Library.groups(user_grooves)
+end
+
+function app.has_user_groove(name)
+  return Library.find_user(user_grooves, Library.clean_name(name)) ~= nil
+end
+
+local function snapshot_pattern()
+  local saved = {}
+  for i = 1, Library.LANES do
+    local lane = config.lanes[i]
+    saved[i] = { steps = lane.steps, accents = lane.accents, ghosts = lane.ghosts, scoring = lane.scoring }
+  end
+  return { lanes = saved, active = config.active_pattern }
+end
+
+-- Old stats describe a different pattern, so a change of pattern starts fresh.
+local function pattern_loaded()
+  session:reset()
+  mark_dirty()
+end
+
+function app.load_pattern(id)
+  local before = snapshot_pattern()
+  local ok, err = Library.apply(config, id, user_grooves)
+  if not ok then return err end
+  app.previous_pattern = before
+  pattern_loaded()
+  return "Loaded " .. config.active_pattern.name
+end
+
+function app.undo_pattern()
+  local p = app.previous_pattern
+  if not p then return end
+  for i = 1, Library.LANES do
+    local lane = config.lanes[i]
+    lane.steps, lane.accents, lane.ghosts = p.lanes[i].steps, p.lanes[i].accents, p.lanes[i].ghosts
+    lane.scoring = p.lanes[i].scoring
+  end
+  config.active_pattern = p.active
+  app.previous_pattern = nil
+  pattern_loaded()
+  return "Restored " .. config.active_pattern.name
+end
+
+function app.set_rudiment_lane(lane)
+  config.rudiment_lane = lane
+  local active = config.active_pattern
+  if active.sticking and not active.modified and active.id then
+    Library.apply(config, active.id, user_grooves)
+    pattern_loaded()
+  else
+    mark_dirty()
+  end
+end
+
+function app.pattern_edited()
+  Library.mark_modified(config)
+  app.config_changed()
+end
+
+local function save_grooves()
+  local ok, err = Config.save_file(grooves_path, user_grooves)
+  app.library_rev = app.library_rev + 1
+  if not ok then return "Could not save grooves: " .. tostring(err) end
+end
+
+function app.save_groove(name)
+  local saved, err = Library.save_user(config, user_grooves, name)
+  if not saved then return err end
+  mark_dirty()
+  return save_grooves() or ("Saved groove " .. saved)
+end
+
+function app.delete_groove(name)
+  if not Library.delete_user(config, user_grooves, name) then return "No such groove" end
+  mark_dirty()
+  return save_grooves() or ("Deleted groove " .. name)
+end
+
 local ui = UI.new(ImGui, app)
 
 local next_slow_check = 0
@@ -182,14 +276,26 @@ end
 
 local publish_seq = 0
 local next_publish = 0
+local published_library_rev
 
 -- Feeds web/drums.html. Non-persistent ExtState: gone when REAPER closes.
 local function publish_remote(t)
   if t < next_publish then return end
   next_publish = t + Remote.PUBLISH_INTERVAL_S
-  if reaper.GetExtState(Remote.SECTION, Remote.KEY_COMMAND) == "reset" then
+  local command = reaper.GetExtState(Remote.SECTION, Remote.KEY_COMMAND)
+  if command ~= "" then
     reaper.DeleteExtState(Remote.SECTION, Remote.KEY_COMMAND, false)
-    session:reset()
+    if command == "reset" then
+      session:reset()
+    else
+      local id = command:match("^load:(.+)$")
+      if id then ui.message = app.load_pattern(id) end
+    end
+  end
+  if published_library_rev ~= app.library_rev then
+    published_library_rev = app.library_rev
+    reaper.SetExtState(Remote.SECTION, Remote.KEY_LIBRARY,
+      Remote.build_library(app.pattern_groups(), app.library_rev), false)
   end
   publish_seq = publish_seq + 1
   reaper.SetExtState(Remote.SECTION, Remote.KEY_SNAPSHOT, Remote.build(app, publish_seq), false)
@@ -215,6 +321,7 @@ end
 reaper.atexit(function()
   save_now()
   reaper.DeleteExtState(Remote.SECTION, Remote.KEY_SNAPSHOT, false)
+  reaper.DeleteExtState(Remote.SECTION, Remote.KEY_LIBRARY, false)
 end)
 -- A reset tapped while the dashboard was closed must not fire on the next open.
 reaper.DeleteExtState(Remote.SECTION, Remote.KEY_COMMAND, false)

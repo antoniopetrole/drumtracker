@@ -32,7 +32,11 @@ Three levels of evidence, kept distinct:
 | Opt-in track creation, and undo removes it | | yes |
 | Audio pass-through: source never writes to `splN` | yes | |
 | All dashboard tabs render without script errors | | yes |
-| Phone page: served by REAPER, gets the same numbers, Play, Stop and Reset work, no fake numbers after reset. Tested over localhost in a headless browser, not on a phone or over Wi-Fi | | yes |
+| Accent and ghost groups, gap, spread, ghost misses and clipping: synthetic hits | yes | yes |
+| Ghost straight after a ringing accent is still detected: 36 of 36, with no extras, on generated audio | | yes |
+| 10 rudiments with stickings, accents and stroke counts; saved grooves round-trip | yes | |
+| Patterns load from the phone page, including awkward groove names; unknown ones change nothing | | yes |
+| Phone page, driven in a real browser with phone-size emulation: keeps updating, picker and buttons work, Reset needs two taps, it reports a closed dashboard and a lost connection, no JavaScript errors. All over localhost, not on a real phone or Wi-Fi | | yes |
 
 ## You: with your interface and kit
 
@@ -67,6 +71,17 @@ Run these in order. If one fails, later ones will likely fail too.
 - [ ] Play, Stop and Reset work. Reset needs two taps.
 - [ ] Close the dashboard: the page says so, and shows no numbers.
 - [ ] Turn off Wi-Fi on the phone: it says it can't reach REAPER, and recovers when Wi-Fi returns.
+
+### C3. Patterns and dynamics
+
+- [ ] Load each kind of pattern from the dashboard and from the phone.
+- [ ] Save a groove, restart REAPER, load it again. Check the accents and ghosts came back.
+- [ ] Clicking grid steps cycles on, accent, ghost, off. Dashboard's *Pattern* picker and *Undo load* work. These clicks haven't been tested: only the commands behind them.
+- [ ] Play the Ghost note groove with obvious accents and very soft ghosts: the gap should read high. Then play them closer in level: it should drop.
+- [ ] **Ghosts missed stays at zero** while you play real ghost notes straight after accents. This is the riskiest part on a real snare.
+- [ ] Single stroke roll at your real speed: Extra stays at zero, so the wires and ring aren't causing false triggers.
+- [ ] A hard hit with a kick or hat, but no snare: does the snare lane score a false ghost?
+- [ ] Turn your preamp gain down a few dB: levels should move and the gap shouldn't.
 
 ### D. Real-world triggering
 

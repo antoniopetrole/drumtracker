@@ -5,7 +5,7 @@ package.path = here .. "/?.lua;" .. here .. "/../lua/?.lua;" .. package.path
 local t = require("harness")
 for _, name in ipairs({
   "test_timing", "test_patterns", "test_matcher", "test_metrics",
-  "test_protocol", "test_session", "test_config", "test_remote",
+  "test_protocol", "test_session", "test_config", "test_remote", "test_library", "test_dynamics",
 }) do
   t.suite(name)
   require(name)

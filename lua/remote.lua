@@ -9,6 +9,7 @@ local R = {}
 R.SECTION = "LiveDrumGrooveMonitor"
 R.KEY_SNAPSHOT = "snapshot"
 R.KEY_COMMAND = "command"
+R.KEY_LIBRARY = "library"
 R.MAX_POINTS = 32
 R.PUBLISH_INTERVAL_S = 1 / 15
 
@@ -114,8 +115,28 @@ function R.build(app, seq)
       }
     end
 
+    local dynamics
+    local dyn = app.session:dynamics(lane)
+    if dyn then
+      local accent_points, ghost_points = {}, {}
+      for _, e in ipairs(app.session:window_entries(lane)) do
+        if e.level == "accent" then accent_points[#accent_points + 1] = e.peak_db end
+        if e.level == "ghost" then ghost_points[#ghost_points + 1] = e.peak_db end
+      end
+      dynamics = {
+        gap = dyn.gap,
+        accent = dyn.accent.mean, accent_sd = dyn.accent.sd, accent_n = dyn.accent.n,
+        ghost = dyn.ghost.mean, ghost_sd = dyn.ghost.sd, ghost_n = dyn.ghost.n,
+        clipped = dyn.accent.clipped + dyn.ghost.clipped,
+        ghost_misses = lane.counts.ghost_misses,
+        accent_points = array(accent_points),
+        ghost_points = array(ghost_points),
+      }
+    end
+
     lanes[#lanes + 1] = {
       index = lane.index,
+      dynamics = dynamics,
       name = lc.name,
       color = color_hex(lc.color),
       scoring = lc.scoring,
@@ -159,11 +180,29 @@ function R.build(app, seq)
     tolerance = config.tolerance_ms,
     range = math.max(50, config.tolerance_ms * 2.5),
     last_hit_age = newest and (now - newest) or nil,
+    pattern = {
+      id = config.active_pattern.id,
+      name = config.active_pattern.name,
+      modified = config.active_pattern.modified == true,
+      sticking = (not config.active_pattern.modified) and config.active_pattern.sticking or nil,
+    },
+    library_rev = app.library_rev,
     detectors = alive_count,
     uncalibrated = array(uncalibrated),
     selftest = array(selftest),
     lanes = array(lanes),
   })
+end
+
+-- The pattern list changes rarely, so it has its own key. groups: Library.groups().
+function R.build_library(groups, rev)
+  local out = {}
+  for g, group in ipairs(groups) do
+    local items = {}
+    for i, item in ipairs(group.items) do items[i] = { id = item.id, name = item.name } end
+    out[g] = { title = group.title, items = array(items) }
+  end
+  return encode({ rev = rev, groups = array(out) })
 end
 
 return R

@@ -61,7 +61,8 @@ Press play, and play the groove. What a few bars might look like (these numbers 
 
 ## Going further
 
-- **Different groove:** edit the steps on the Pattern tab. Changes apply straight away.
+- **Different groove:** edit the steps on the Pattern tab. Changes apply straight away. Save it to keep it.
+- **Work on dynamics:** load the Ghost note groove or a rudiment, and watch the accent-ghost gap.
 - **Skip your lead-in:** Settings > *Score from bar*.
 - **Practise a section:** set a loop that's a whole number of bars.
 - **Save it:** Settings > Presets.

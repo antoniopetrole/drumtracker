@@ -25,13 +25,13 @@ Calibration is applied to the hit's time **before** matching, so a large latency
 ## Detection
 
 1. The channel you chose goes through optional detection-only filters, then is rectified into a peak envelope with instant attack.
-2. A trigger needs the envelope above threshold and the retrigger interval elapsed. It also needs either that the envelope has fallen below threshold minus hysteresis since the last hit, or that this attack clears a mask set by the previous peak, decaying over `Ring mask decay`. That lets a fast second stroke through while a ringing drum can't re-trigger itself.
+2. A trigger needs the envelope above threshold and the retrigger interval elapsed. It also needs one of three things: the envelope has fallen below threshold minus hysteresis since the last hit; this attack clears a mask set by the previous peak, decaying over `Ring mask decay`; or the signal has jumped by `Re-attack jump` above where the envelope was 2 ms ago. The jump is what lets a ghost note through on a still-ringing drum, which the mask alone would hide.
 3. **Backdating:** threshold crossing lags the true start of the attack, so the detector looks back up to 5 ms for the first sample above a quarter of the threshold that follows at least 1 ms of quiet. With no quiet run, as when a hit lands on a still-ringing drum, it reports the crossing itself, which is slightly late.
-4. **Confirm window** (2 ms by default): the hit is published that much later so it can report its true peak. This delays the event only, not its timestamp.
+4. **Confirm window** (5 ms by default): the hit is published that much later so it can report its true peak. This delays the event only, not its timestamp. Accent and ghost levels come from this peak, and too short a window under-reads low drums: a 60 Hz tone's peak read 0.55 at 2 ms and 0.75 at 5 ms, against a true 0.8.
 
 Filters add a small delay of their own that isn't compensated: under 1 ms for a low-pass around 200 Hz, less for higher settings. Calibrate with your filters set.
 
-Tested in REAPER with synthetic audio at -30 dB threshold: a 120 ms-ring 200 Hz tone, a 60 Hz tone, two strokes 100 ms apart and a -24 dB stroke each gave exactly one onset within about 0.1 ms, and a -40 dB stroke gave none. Real drums are messier: only your kit can tell you how good the defaults are.
+Tested in REAPER with synthetic audio at -30 dB threshold: a 120 ms-ring 200 Hz tone, a 60 Hz tone, two strokes 100 ms apart and a -24 dB stroke each gave exactly one onset within about 0.1 ms, and a -40 dB stroke gave none. 16ths with accents 18 dB above ghosts, each accent still ringing when the next ghost lands, gave 12 of 12 accents and 36 of 36 ghosts with no extras, and a measured gap of 17.3 dB. Real drums are messier: the stick noise and wires on a real snare could set off the re-attack check, so only your kit can tell you how good the defaults are.
 
 ## Display lag
 

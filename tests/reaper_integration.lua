@@ -401,6 +401,80 @@ step(0.3, function()
   end
 end)
 
+-- 7c: accents and ghosts: is each one detected, and is the gap right? ------------
+local dyn_track
+step(0.2, function()
+  reaper.DeleteTrack(drum_track)
+  local _, device_srate = reaper.GetAudioDeviceInfo("SRATE")
+  local srate = tonumber(device_srate) or 44100
+  local n = srate * 9
+  local data = {}
+  for i = 1, n do data[i] = 0 end
+  -- 16ths at 120 BPM: accent on each beat, 18 dB louder. The accent is still ringing
+  -- when the next ghost lands, which is the hard case for a detector.
+  -- Starts at bar 2, as an item's fade-in would change the very first note's level.
+  for step_index = 16, 63 do
+    local t0 = step_index * 0.125
+    local accent = step_index % 4 == 0
+    local amp, tau = accent and 0.8 or 0.1, accent and 0.040 or 0.015
+    local start = math.floor(t0 * srate + 0.5)
+    for k = 0, math.floor(tau * 8 * srate) do
+      local i = start + k + 1
+      if i <= n then
+        data[i] = data[i] + amp * math.exp(-k / (tau * srate)) * math.sin(2 * math.pi * 400 * k / srate)
+      end
+    end
+  end
+  local path = dir .. "ldgm_dynamics.wav"
+  local f = assert(io.open(path, "wb"))
+  f:write("RIFF", string.pack("<I4", 36 + n * 4), "WAVE")
+  f:write("fmt ", string.pack("<I4I2I2I4I4I2I2", 16, 3, 1, srate, srate * 4, 4, 32))
+  f:write("data", string.pack("<I4", n * 4))
+  for i = 1, n do f:write(string.pack("<f", data[i])) end
+  f:close()
+  dyn_track = add_detector("Dynamics", 6, -30)
+  local item = reaper.AddMediaItemToTrack(dyn_track)
+  local take = reaper.AddTakeToMediaItem(item)
+  reaper.SetMediaItemTake_Source(take, reaper.PCM_Source_CreateFromFile(path))
+  reaper.SetMediaItemInfo_Value(item, "D_POSITION", 0)
+  reaper.SetMediaItemInfo_Value(item, "D_LENGTH", 9)
+  reaper.UpdateItemInProject(item)
+  session.config.origin_bar = 2
+  session:reset()
+  local lc = session.config.lanes[6]
+  lc.scoring = true
+  lc.steps, lc.accents, lc.ghosts = {}, {}, {}
+  for s = 0, 15 do
+    lc.steps[#lc.steps + 1] = s
+    if s % 4 == 0 then lc.accents[#lc.accents + 1] = s else lc.ghosts[#lc.ghosts + 1] = s end
+  end
+  session.config.window_mode = "bars16"
+  session:config_changed()
+  start_transport()
+end)
+step(7.9, function()
+  reaper.Main_OnCommand(1016, 0)
+end)
+step(0.3, function()
+  local lane = session.lanes[6]
+  local d = session:dynamics(lane)
+  log(string.format("dynamics: accents n=%d %.2f dB sd=%s | ghosts n=%d %.2f dB sd=%s | gap %s | miss %d (ghost %d) extra %d",
+    d.accent.n, d.accent.mean or 0, tostring(d.accent.sd), d.ghost.n, d.ghost.mean or 0, tostring(d.ghost.sd),
+    tostring(d.gap), lane.counts.misses, lane.counts.ghost_misses, lane.counts.extras))
+  check("dynamics: no ghost lost after an accent", lane.counts.ghost_misses == 0, lane.counts.ghost_misses)
+  check("dynamics: all of both measured", d.accent.n == 12 and d.ghost.n == 36, d.accent.n .. "/" .. d.ghost.n)
+  near("dynamics: 18 dB gap measures 18 dB", d.gap, 20 * math.log(0.8 / 0.1, 10), 1.0)
+  -- A ghost straight after an accent lands on its ring, so it reads a little louder.
+  check("dynamics: a clean take reads consistent", d.accent.sd < 0.5 and d.ghost.sd < 1.5, tostring(d.accent.sd) .. " / " .. tostring(d.ghost.sd))
+  check("dynamics: ring and ghosts make no extras", lane.counts.extras == 0, lane.counts.extras)
+  lane.counts.ghost_misses = 0
+  session.config.lanes[6].steps, session.config.lanes[6].accents, session.config.lanes[6].ghosts = {}, {}, {}
+  session.config.window_mode = "hits32"
+  session.config.origin_bar = 1
+  reaper.DeleteTrack(dyn_track)
+  session:config_changed()
+end)
+
 -- 8: the real setup shape: opt-in tracks, armed, monitoring only ----------------
 local created_before
 step(0.2, function()
@@ -471,6 +545,16 @@ step(0.1, function()
     session = nil
     start_transport()
     dofile(base .. "Live Drum Groove Monitor.lua")
+    -- Lets the rig switch the snare to the self-test with a known 18 dB gap.
+    local function watch_dynamics_request()
+      if reaper.GetExtState("LDGMTest", "dynamics") == "on" then
+        reaper.DeleteExtState("LDGMTest", "dynamics", false)
+        self_test(snare_track, snare_fx, 4, 5)
+        return -- a live defer would keep the dashboard's atexit from running
+      end
+      reaper.defer(watch_dynamics_request)
+    end
+    watch_dynamics_request()
   end
 end)
 

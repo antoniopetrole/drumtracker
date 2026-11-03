@@ -70,6 +70,49 @@ The top plot is the one to glance at. Each dot is a hit, the tall tick is your b
 | **Extra** | Onset with no expected note. Bleed and double-trigger suspects are in Diagnostics |
 | `--` | No data. Never shown as 0, so silence can't look like perfect timing |
 
+## Patterns: rudiments and your own grooves
+
+Choose a pattern from the **Pattern** tab, or from the picker on the phone page. Loading one resets the session stats, since they describe the old pattern. It never changes your calibration or thresholds. On the dashboard, *Undo load* brings back what you had.
+
+**Built in:**
+
+- **10 rudiments:** single and double stroke rolls, single and triple paradiddles, single stroke four and seven, and five, seven, nine and thirteen stroke rolls.
+- **2 grooves:** Rock beat, and Ghost note groove.
+
+Rudiments go on one lane (Snare by default; change it under *Play it on*). The letters are the sticking, as a reading guide. A mic can't tell which hand hit, so nothing checks your sticking. On one mic a paradiddle and a single stroke roll have the same timing, and what sets them apart is where the accents fall.
+
+Flams, drags and triplet-based rudiments like the paradiddle-diddle aren't included, because they don't fit the 16th-note grid.
+
+**Your own:** set up the grid, type a name, and click *Save groove*. Saving under an existing name asks first. Grooves live in `%APPDATA%\REAPER\Data\LiveDrumGrooveMonitor\grooves.lua`, and appear on the phone too.
+
+These are separate from Settings > *Presets*, which save everything, including calibration.
+
+## Accents and ghost notes
+
+Clicking a grid step cycles it: on, accent (`>`), ghost (`g`), off. Rudiments and the Ghost note groove come marked already.
+
+For any lane with marked steps, you get:
+
+| On screen | Meaning |
+|---|---|
+| **Accent-ghost gap** | How much louder your accents are than your ghosts, in dB. The number to watch |
+| **Accent / ghost level** | Average peak of each. Depends on your mic gain, so compare these only within a session |
+| **Accent / ghost spread** | How consistent each one is. Lower is steadier |
+| **Ghosts missed** | Marked ghosts with no hit. Too many usually means the threshold is above your ghost notes |
+| **Clipped** | Hits that reached full scale. Clipped accents read too quiet, so the gap reads too small: turn your gain down |
+
+As a rule of thumb, every 6 dB is about double the signal level at the mic.
+
+**What this measures:** peak level at the mic, not how loud a hit sounds in the room. It's excellent for comparing your own accents and ghosts on one drum, but a dB figure on one drum can't be compared with another drum or mic.
+
+**Three things can skew it:**
+
+- **Missed ghosts aren't in the average.** If your softest ghosts fall below the threshold, the ones left are your louder ones, and the gap reads too small. Keep Ghosts missed at zero by lowering the threshold, then check bleed isn't triggering it.
+- **A ghost right after an accent sits on the accent's ring,** so it reads a little loud. In a synthetic test this took 18.1 dB down to 17.3 dB. A dampened snare will be affected less than a ringing one.
+- **Bleed can count as a ghost.** Your ghost is the softest thing on that mic, so a kick or hat can be louder at the snare mic than a real ghost. If ghost timing or level looks wrong, try the detection high-pass on the snare's FX window.
+
+If you upgrade from an earlier version, check each existing detector's FX window: *Peak confirm window* should be 5 ms, as tracks you already made keep their old 2 ms, which under-reads low drums. *Re-attack jump* should read 6 dB.
+
 ## See it on your phone or tablet
 
 If your kit is in another room, open the results on any device on the same network. The dashboard must stay open on the PC, because that's where the scoring happens. Network delay only affects when you see a result, never the numbers.
@@ -81,7 +124,7 @@ If your kit is in another room, open the results on any device on the same netwo
 
 ![Phone page, driven by the built-in self-test](docs/phone.png)
 
-The page shows each drum's latest offset, a strip of recent hits, bias and spread, plus Play, Stop and Reset. Reset takes two taps, so a stray stick can't wipe your session. Thresholds and calibration are still set on the PC.
+The page shows each drum's latest offset, a strip of recent hits, bias and spread, the accent-ghost gap where steps are marked, and a pattern picker, plus Play, Stop and Reset. Reset takes two taps, so a stray stick can't wipe your session. Lanes a pattern doesn't use are hidden. Thresholds, calibration and grid editing stay on the PC.
 
 Set your device's screen timeout to something long while you play, because browsers usually can't keep the screen awake on a plain `http` page.
 
@@ -111,8 +154,9 @@ Until you calibrate, **every hit reads late by your round-trip latency**, even w
 | `Detector not running` | FX bypassed, or the audio device closed |
 | Meter stays dead | Track armed? Monitoring on? Right mono input? Input enabled in Preferences > Audio > Device? |
 | `Two detectors share this lane` | Fix a Lane ID. The second instance stands by and can't corrupt data |
-| Hits missed | Lower the threshold. Very soft strokes right after a loud one may fall under the ring mask: shorten `Ring mask decay` |
-| One hit counts twice | Raise the threshold, lengthen `Retrigger interval`, or lengthen `Ring mask decay` |
+| Hits missed | Lower the threshold |
+| One hit counts twice | Raise the threshold, lengthen `Retrigger interval`, or raise `Re-attack jump` |
+| Ghost notes after accents go missing | Lower the threshold, lower `Re-attack jump`, or try `Detection high-pass` around 1000 Hz |
 | Bleed: snare triggers the hat lane | Raise the hat threshold, and use `Detection high-pass` on the hat. Use `Detection low-pass` to reject bleed on the kick |
 | Everything reads a steady +N ms | That's latency: calibrate |
 | Numbers all look wrong, nothing fits the grid | Project bar lines off? This assumes bar 1 starts at time 0 |

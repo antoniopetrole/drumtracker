@@ -7,6 +7,7 @@ local Patterns = require("patterns")
 local Matcher = require("matcher")
 local Metrics = require("metrics")
 local Timing = require("timing")
+local Library = require("library")
 
 local S = {}
 S.__index = S
@@ -15,11 +16,13 @@ S.BLEED_WINDOW_S = 0.008  -- extra this close to another lane's onset is a bleed
 S.DOUBLE_WINDOW_S = 0.040 -- extra this close to this lane's own onset is a double suspect
 S.ALIVE_TIMEOUT_S = 1.0
 S.RECENT_ONSETS = 16
+S.CLIP_LEVEL = 0.98
 
 local function new_counts()
   return {
     detected = 0, hits = 0, misses = 0, extras = 0,
     suspect_bleed = 0, suspect_double = 0, unscored = 0,
+    ghost_misses = 0, accent_misses = 0,
   }
 end
 
@@ -100,6 +103,8 @@ end
 
 local function on_result(self, lane, result)
   local c = lane.counts
+  local levels = Library.level_map(self.config.lanes[lane.index])
+  local level = result.step and levels[result.step % Patterns.STEPS] or nil
   if result.kind == "hit" then
     c.hits = c.hits + 1
     Metrics.push(lane.history, {
@@ -107,6 +112,9 @@ local function on_result(self, lane, result)
       signed_ms = result.signed_ms,
       step = result.step,
       peak = result.peak,
+      level = level,
+      peak_db = 20 * math.log(math.max(result.peak, 1e-7), 10),
+      clipped = result.peak >= S.CLIP_LEVEL,
       played_s = played_time(lane, result.hit_s),
     })
     lane.latest = {
@@ -117,6 +125,8 @@ local function on_result(self, lane, result)
     }
   elseif result.kind == "miss" then
     c.misses = c.misses + 1
+    if level == "ghost" then c.ghost_misses = c.ghost_misses + 1 end
+    if level == "accent" then c.accent_misses = c.accent_misses + 1 end
   elseif result.kind == "extra" then
     c.extras = c.extras + 1
     result.suspect = classify_extra(self, lane, result)
@@ -297,6 +307,12 @@ end
 
 function S:stats(lane)
   return Metrics.compute(self:window_entries(lane))
+end
+
+-- Nil when this lane's pattern doesn't mark any accents or ghosts.
+function S:dynamics(lane)
+  if not Library.has_dynamics(self.config.lanes[lane.index]) then return nil end
+  return Metrics.dynamics(self:window_entries(lane))
 end
 
 S.format_ms = Timing.format_ms

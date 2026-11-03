@@ -16,6 +16,7 @@ For the dashboard test, work_dir needs reaper_imgui-x64.dll, and
 res/Scripts/ReaTeam Extensions/API/imgui.lua from ReaImGui's shims/ directory.
 """
 import atexit
+import base64
 import ctypes
 import ctypes.wintypes as wt
 import os
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import json
 import time
+import urllib.parse
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -111,28 +113,80 @@ def read_snapshot(port):
     return json.loads(raw), len(text)
 
 
-def browser_shot(port, name, width, height, work):
-    """Renders the page inside an iframe of exactly this size. Headless windows have
-    a minimum width, and this also proves the page can be embedded. Uses a throwaway
-    browser profile, so it never touches a real one."""
-    exe = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-    shots = os.path.join(work, "shots")
-    out = os.path.join(shots, name + ".png")
-    frame = os.path.join(shots, name + "_frame.html")
-    with open(frame, "w") as f:
-        f.write('<!doctype html><body style="margin:0;background:#000">'
-                '<iframe src="http://127.0.0.1:%s/drums.html" width="%d" height="%d" '
-                'style="border:0;display:block"></iframe></body>' % (port, width, height))
-    subprocess.run([exe, "--headless=new", "--disable-gpu", "--hide-scrollbars",
-                    "--user-data-dir=" + os.path.join(work, "edge-profile-" + name),
-                    "--window-size=%d,%d" % (max(width, 520), height), "--virtual-time-budget=4000",
-                    "--screenshot=" + out, "file:///" + frame.replace("\\", "/")],
-                   timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(100):  # the browser can return before the file lands
-        if os.path.exists(out):
-            break
-        time.sleep(0.1)
-    print("shot", name, os.path.exists(out), flush=True)
+class Page:
+    """A real headless browser driven over its debugging protocol: real time, true
+    device emulation, JS errors reported. Uses a throwaway profile. Needs the
+    websocket-client package."""
+
+    def __init__(self, port, work, width=390, height=844, debug_port=19222):
+        import websocket
+        exe = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+        self.work = work
+        self.errors = []
+        self.profile = os.path.join(work, "edge-profile-%d" % debug_port)
+        self.proc = subprocess.Popen(
+            [exe, "--headless=new", "--disable-gpu", "--remote-debugging-port=%d" % debug_port,
+             "--remote-allow-origins=*", "--no-first-run",
+             "--user-data-dir=" + self.profile, "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        target = None
+        for _ in range(100):
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/json" % debug_port, timeout=2) as r:
+                    pages = [t for t in json.load(r) if t["type"] == "page"]
+                if pages:
+                    target = pages[0]
+                    break
+            except OSError:
+                pass
+            time.sleep(0.2)
+        self.ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=20)
+        self.next_id = 0
+        self.call("Runtime.enable")
+        self.call("Page.enable")
+        self.call("Emulation.setDeviceMetricsOverride",
+                  width=width, height=height, deviceScaleFactor=2, mobile=width < 800)
+        self.call("Page.navigate", url="http://127.0.0.1:%s/drums.html" % port)
+
+    def call(self, method, **params):
+        self.next_id += 1
+        self.ws.send(json.dumps({"id": self.next_id, "method": method, "params": params}))
+        while True:
+            msg = json.loads(self.ws.recv())
+            if msg.get("method") == "Runtime.exceptionThrown":
+                detail = msg["params"]["exceptionDetails"]
+                self.errors.append(detail.get("exception", {}).get("description") or detail.get("text"))
+            if msg.get("id") == self.next_id:
+                return msg.get("result", {})
+
+    def eval(self, expression):
+        result = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
+        if "exceptionDetails" in result:
+            self.errors.append(str(result["exceptionDetails"]))
+            return None
+        return result["result"].get("value")
+
+    def resize(self, width, height):
+        self.call("Emulation.setDeviceMetricsOverride",
+                  width=width, height=height, deviceScaleFactor=2, mobile=width < 800)
+
+    def shot(self, name):
+        data = self.call("Page.captureScreenshot", format="png")["data"]
+        with open(os.path.join(self.work, "shots", name + ".png"), "wb") as f:
+            f.write(base64.b64decode(data))
+
+    def close(self):
+        try:
+            self.ws.close()
+        finally:
+            self.proc.kill()
+            # Edge's helpers detach from the process we started, so find them by this
+            # run's throwaway profile. That also keeps this away from any real browser.
+            script = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+                      "Where-Object { $_.CommandLine -like '*" + self.profile.replace("'", "''") + "*' } | "
+                      "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+            subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def check_web_page(port, work):
@@ -141,7 +195,6 @@ def check_web_page(port, work):
 
     page, headers = http_get(port, "drums.html")
     report("page served from the user www root", "Drum Timing" in page, len(page))
-    print("web headers:", {k: v for k, v in headers.items()}, flush=True)
 
     first, size = read_snapshot(port)
     report("snapshot parses as JSON", first["version"] == 1, "%d bytes" % size)
@@ -149,26 +202,100 @@ def check_web_page(port, work):
     second, _ = read_snapshot(port)
     report("seq advances while the dashboard runs", second["seq"] > first["seq"], second["seq"])
     lanes = {l["name"]: l for l in second["lanes"]}
-    report("snare bias reaches the page as +15", abs(lanes["Snare"]["bias"] - 15) < 0.1, lanes["Snare"]["bias"])
-    report("hat bias reaches the page as -8", abs(lanes["Hi-hat"]["bias"] + 8) < 0.1, lanes["Hi-hat"]["bias"])
-    report("self-test is flagged to the page", len(second["selftest"]) == 3, second["selftest"])
+    report("snare bias is +15", abs(lanes["Snare"]["bias"] - 15) < 0.1, lanes["Snare"]["bias"])
+    report("hat bias is -8", abs(lanes["Hi-hat"]["bias"] + 8) < 0.1, lanes["Hi-hat"]["bias"])
+    report("self-test is flagged", len(second["selftest"]) == 3, second["selftest"])
 
-    browser_shot(port, "phone", 390, 844, work)
-    browser_shot(port, "tablet", 1180, 820, work)
+    batch, _ = http_get(port, "_/GET/EXTSTATE/LiveDrumGrooveMonitor/snapshot;GET/EXTSTATE/LiveDrumGrooveMonitor/library;")
+    keys = [line.split("\t")[2] for line in batch.split("\n") if line.startswith("EXTSTATE")]
+    report("a batched request returns both values", keys == ["snapshot", "library"], keys)
 
-    http_get(port, "_/1016")
-    time.sleep(0.6)
-    report("Stop button's command stops the transport", read_snapshot(port)[0]["playing"] is False)
-    before = read_snapshot(port)[0]["lanes"][1]["hits"]
-    http_get(port, "_/SET/EXTSTATE/LiveDrumGrooveMonitor/command/reset")
-    time.sleep(0.6)
-    after = read_snapshot(port)[0]["lanes"][1]
-    report("Reset button's command clears results", after["hits"] == 0 and before > 0, "%s -> %s" % (before, after["hits"]))
-    report("after reset there are no fake numbers", after.get("bias") is None and after.get("latest") is None, after.get("bias"))
-    browser_shot(port, "phone_reset", 390, 844, work)
-    http_get(port, "_/1007")
-    time.sleep(0.6)
-    report("Play button's command starts the transport", read_snapshot(port)[0]["playing"] is True)
+    # From here on, everything goes through the actual page in a real browser.
+    browser = Page(port, work)
+    try:
+        time.sleep(2)
+        seq_a = browser.eval("lastSeq")
+        time.sleep(1.5)
+        seq_b = browser.eval("lastSeq")
+        report("page keeps polling, it doesn't freeze", seq_b is not None and seq_a is not None and seq_b > seq_a, "%s -> %s" % (seq_a, seq_b))
+        report("page says it's connected", "detector" in (browser.eval("document.getElementById('conn').textContent") or ""),
+               browser.eval("document.getElementById('conn').textContent"))
+        browser.shot("phone")
+        report("rock beat card shows +15", "+15" in (browser.eval("document.querySelectorAll('.lane .value')[1].textContent") or ""),
+               browser.eval("document.querySelectorAll('.lane .value')[1].textContent"))
+
+        picker = lambda: browser.eval("document.getElementById('pattern').value")
+        option_count = browser.eval("document.getElementById('pattern').options.length")
+        groups = browser.eval("Array.from(document.querySelectorAll('#pattern optgroup')).map(g => g.label + ':' + g.children.length)")
+        report("picker is filled", groups == ["Rudiments:10", "Grooves:2", "My grooves:1"], groups)
+        report("picker has an entry for each pattern", option_count == 14, option_count)
+        report("picker shows what's loaded", picker() == "__custom" or picker() == "groove:rock", picker())
+
+        def choose(pattern_id):
+            browser.eval("var e = document.getElementById('pattern'); e.value = %s; e.dispatchEvent(new Event('change'));" % json.dumps(pattern_id))
+            time.sleep(1.2)
+            return read_snapshot(port)[0]
+
+        snap = choose("rudiment:single-paradiddle")
+        by_name = {l["name"]: l for l in snap["lanes"]}
+        report("choosing a rudiment on the page loads it", snap["pattern"]["name"] == "Single paradiddle", snap["pattern"]["name"])
+        report("sticking reaches REAPER's snapshot", snap["pattern"].get("sticking") == "RlrrLrllRlrrLrll", snap["pattern"].get("sticking"))
+        report("rudiment scores the snare and mutes the rest", by_name["Snare"]["scoring"] and not by_name["Kick"]["scoring"])
+        report("loading a pattern starts fresh stats", by_name["Snare"]["hits"] < 3, by_name["Snare"]["hits"])
+        time.sleep(0.5)
+        report("picker follows the load", picker() == "rudiment:single-paradiddle", picker())
+        report("sticking is on the page", (browser.eval("document.getElementById('sticking').textContent") or "").startswith("Rlrr"),
+               browser.eval("document.getElementById('sticking').textContent"))
+        report("muted lanes are hidden", browser.eval("document.querySelectorAll('.lane').length") == 1,
+               browser.eval("document.querySelectorAll('.lane').length"))
+        browser.shot("phone_rudiment")
+
+        snap = choose("user:My funk: 1")
+        report("an awkward saved-groove name loads from the page", snap["pattern"]["name"] == "My funk: 1", snap["pattern"]["name"])
+        report("a groove has no sticking", snap["pattern"].get("sticking") is None)
+        report("sticking leaves the page", browser.eval("document.getElementById('sticking').hidden") is True)
+        snap = choose("rudiment:does-not-exist")
+        report("an unknown pattern changes nothing", snap["pattern"]["name"] == "My funk: 1", snap["pattern"]["name"])
+        snap = choose("groove:rock")
+        report("back to the rock beat", snap["pattern"]["name"] == "Rock beat", snap["pattern"]["name"])
+        time.sleep(2.5)
+        snap = read_snapshot(port)[0]
+        report("hits score again after the switch", {l["name"]: l for l in snap["lanes"]}["Snare"]["hits"] >= 1)
+
+        snap = choose("rudiment:single-paradiddle")
+        http_get(port, "_/SET/EXTSTATE/LDGMTest/dynamics/on")
+        time.sleep(1)
+        browser.eval("document.getElementById('reset').click(); document.getElementById('reset').click();")
+        time.sleep(6)
+        snap = read_snapshot(port)[0]
+        snare = {l["name"]: l for l in snap["lanes"]}["Snare"]
+        dyn = snare.get("dynamics") or {}
+        report("two taps of Reset clear, then the 18 dB self-test reads 18 dB", abs((dyn.get("gap") or 0) - 18.06) < 1, dyn.get("gap"))
+        report("no ghosts lost in the self-test", dyn.get("ghost_misses") == 0, dyn.get("ghost_misses"))
+        report("timing reads +5 ms alongside it", abs((snare.get("bias") or 0) - 5) < 0.2, snare.get("bias"))
+        gap_text = browser.eval("document.querySelector('.gapvalue').textContent")
+        report("the gap is on the page", (gap_text or "").startswith("18"), gap_text)
+        browser.shot("phone_dynamics")
+        browser.resize(1180, 820)
+        time.sleep(0.5)
+        browser.shot("tablet_dynamics")
+        browser.resize(390, 844)
+
+        before = read_snapshot(port)[0]["lanes"][1]["hits"]
+        browser.eval("document.getElementById('reset').click();")
+        time.sleep(0.6)
+        report("one tap of Reset doesn't clear anything", read_snapshot(port)[0]["lanes"][1]["hits"] >= before)
+        report("Reset asks for a second tap", browser.eval("document.getElementById('reset').textContent") == "Tap again")
+
+        browser.eval("document.getElementById('stop').click();")
+        time.sleep(0.8)
+        report("Stop on the page stops the transport", read_snapshot(port)[0]["playing"] is False)
+        browser.eval("document.getElementById('play').click();")
+        time.sleep(0.8)
+        report("Play on the page starts it", read_snapshot(port)[0]["playing"] is True)
+        report("no JavaScript errors", not browser.errors, browser.errors)
+    finally:
+        browser.close()
 
 
 def capture_ui(proc, work):
@@ -201,11 +328,17 @@ def capture_ui(proc, work):
         text, _ = http_get(web_port, "_/GET/EXTSTATE/LiveDrumGrooveMonitor/snapshot")
         cleared = text.split("\n")[0].split("\t")[3:] in ([], [""])
         print("%s  web: closing the dashboard clears the snapshot" % ("PASS" if cleared else "FAIL"), flush=True)
-        browser_shot(web_port, "phone_closed", 390, 500, work)
+        closed_page = Page(web_port, work, debug_port=19223)
+        time.sleep(2.5)
+        print("%s  web: page says the dashboard is closed" % ("PASS" if closed_page.eval("document.getElementById('conn').textContent") == "Dashboard closed" else "FAIL"), flush=True)
+        closed_page.shot("phone_closed")
     proc.kill()
     if web_port:
-        time.sleep(1)
-        browser_shot(web_port, "phone_unreachable", 390, 500, work)
+        time.sleep(3)
+        conn = closed_page.eval("document.getElementById('conn').textContent")
+        print("%s  web: an open page says it lost REAPER  [%s]" % ("PASS" if conn == "Can't reach REAPER" else "FAIL", conn), flush=True)
+        closed_page.shot("phone_unreachable")
+        closed_page.close()
 
 
 def snapshot(path):
@@ -257,6 +390,14 @@ def main():
         text = text.replace("[REAPER]\n", "[REAPER]\ncsurf_cnt=1\ncsurf_0=HTTP 0 %s '' '' 0 ''\n" % port, 1)
     with open(ini, "w") as f:
         f.write(text)
+
+    data_dir = os.path.join(res, "Data", "LiveDrumGrooveMonitor")
+    os.makedirs(data_dir, exist_ok=True)
+    with open(os.path.join(data_dir, "settings.lua"), "w") as f:
+        f.write("return { }")
+    with open(os.path.join(data_dir, "grooves.lua"), "w") as f:
+        f.write('return { { name = "My funk: 1", lanes = { { steps = { 0, 3 }, scoring = true }, '
+                '{ steps = { 4, 12 }, scoring = true } } } }')
 
     results = os.path.join(work, "results.txt")
     for p in (results, results + ".done"):

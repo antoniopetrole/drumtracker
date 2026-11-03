@@ -48,6 +48,22 @@
   }
   .banner.bad { border-left-color: var(--bad); color: var(--ink); }
   .banner[hidden] { display: none; }
+  #picker { margin: 0 0 8px; }
+  select {
+    width: 100%; height: 44px; padding: 0 10px; border: 0; border-radius: 10px;
+    background: var(--button); color: var(--ink); font: 600 16px system-ui, sans-serif;
+  }
+  select:disabled { opacity: 0.4; }
+  #sticking {
+    margin-top: 6px; color: var(--ink); text-align: center; white-space: nowrap;
+    font: 400 17px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #sticking span { display: inline-block; width: 1.05em; }
+  #sticking .accent { font-weight: 800; font-size: 1.25em; }
+  #sticking .ghost { color: var(--ink-3); }
+  #sticking .rest { color: var(--line); }
+  #sticking .beat { width: 0.5em; }
+  #sticking[hidden] { display: none; }
   #lanes {
     display: grid; gap: 10px;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
@@ -65,6 +81,15 @@
   .message { color: var(--ink-3); font-size: 14px; align-self: center; }
   .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); } .none { color: var(--ink-3); }
   canvas { display: block; width: 100%; height: 58px; }
+  .dyn { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .dyn[hidden] { display: none; }
+  .gap { display: flex; align-items: baseline; gap: 8px; }
+  .gap strong { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .gap span { color: var(--ink-2); font-size: 14px; }
+  .levels { color: var(--ink-2); font-size: 13px; margin: 2px 0 6px; font-variant-numeric: tabular-nums; }
+  .warnline { color: var(--warn); font-size: 13px; margin-top: 4px; }
+  .warnline:empty { display: none; }
+  canvas.dbstrip { height: 42px; }
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 8px; font-variant-numeric: tabular-nums; }
   .stats div { min-width: 0; }
   .stats span { display: block; color: var(--ink-3); font-size: 12px; }
@@ -87,11 +112,17 @@
     .banner { margin-bottom: 5px; padding: 4px 8px; font-size: 12px; }
     #selftest, #uncal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #lanes { gap: 6px; }
+    select { height: 38px; font-size: 15px; }
+    #picker { margin-bottom: 5px; }
+    #sticking { font-size: 17px; margin-top: 3px; }
     .lane { padding: 6px 10px 8px; }
     .readout { min-height: 46px; margin: 0 0 2px; }
     .value { font-size: 38px; }
     .word { font-size: 14px; }
     canvas { height: 46px; }
+    canvas.dbstrip { height: 36px; }
+    .gap strong { font-size: 24px; }
+    .dyn { margin-top: 6px; padding-top: 5px; }
     .stats { margin-top: 4px; }
     .stats span { font-size: 11px; }
     .stats strong { font-size: 15px; }
@@ -112,6 +143,10 @@
   <span id="position"></span>
   <span id="click"></span>
 </header>
+<div id="picker">
+  <select id="pattern" aria-label="Pattern" disabled></select>
+  <div id="sticking" hidden></div>
+</div>
 <div id="problem" class="banner bad" role="alert" hidden></div>
 <div id="selftest" class="banner" hidden></div>
 <div id="uncal" class="banner" hidden></div>
@@ -138,13 +173,17 @@ function el(id) { return document.getElementById(id); }
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 var C = { plot: css("--plot"), line: css("--line"), ink: css("--ink"), ink3: css("--ink-3"), band: css("--band"), bad: css("--bad") };
 
-// Tab-delimited reply, with \t \n and \\ escaped inside strings.
+// Tab-delimited reply lines, with \t \n and \\ escaped inside strings. Returns
+// the values by key.
 function parseExtState(text) {
-  var line = text.split("\n")[0];
-  var parts = line.split("\t");
-  if (parts[0] !== "EXTSTATE" || parts.length < 4) return null;
-  return parts.slice(3).join("\t")
-    .replace(/\\t/g, "\t").replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+  var values = {};
+  text.split("\n").forEach(function (line) {
+    var parts = line.split("\t");
+    if (parts[0] !== "EXTSTATE" || parts.length < 4) return;
+    values[parts[2]] = parts.slice(3).join("\t")
+      .replace(/\\t/g, "\t").replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+  });
+  return values;
 }
 
 function request(path, timeout) {
@@ -157,16 +196,27 @@ function request(path, timeout) {
   }).catch(function (e) { clearTimeout(timer); throw e; });
 }
 
+// Everything goes out in one request at a time, batched the way REAPER's own web
+// client does it: a request sent while another is in flight can get lost.
+var pending = [], wantLibrary = false;
+
 function poll() {
-  request("GET/EXTSTATE/" + SECTION + "/snapshot").then(function (text) {
+  var parts = pending.splice(0, pending.length);
+  parts.push("GET/EXTSTATE/" + SECTION + "/snapshot");
+  if (wantLibrary) parts.push("GET/EXTSTATE/" + SECTION + "/library");
+  request(parts.join(";") + ";").then(function (text) {
     reachable = true;
-    var raw = parseExtState(text);
-    if (raw) {
-      var data = JSON.parse(raw);
+    var values = parseExtState(text);
+    if (values.snapshot) {
+      var data = JSON.parse(values.snapshot);
       if (data.seq !== lastSeq) { lastSeq = data.seq; lastSeqAt = Date.now(); }
       snapshot = data;
     } else {
       snapshot = null;
+    }
+    if (wantLibrary && values.library) {
+      fillPicker(JSON.parse(values.library));
+      wantLibrary = false;
     }
   }).catch(function () {
     reachable = false;
@@ -201,12 +251,15 @@ function makeCard(lane) {
     '<div><span>Spread</span><strong class="spread"></strong></div>' +
     '<div><span>Miss</span><strong class="misses"></strong></div>' +
     '<div><span>Extra</span><strong class="extras"></strong></div>' +
-    '</div>';
+    '</div>' +
+    '<div class="dyn" hidden><div class="gap"><strong class="gapvalue"></strong><span>accent-ghost gap</span></div>' +
+    '<div class="levels"></div><canvas class="dbstrip" aria-hidden="true"></canvas><div class="warnline"></div></div>';
   el("lanes").appendChild(root);
   var q = function (s) { return root.querySelector(s); };
   return {
     root: root, swatch: q(".swatch"), name: q(".name"), level: q(".meter i"), thr: q(".meter b"),
     value: q(".value"), word: q(".word"), message: q(".message"), canvas: q("canvas"),
+    dyn: q(".dyn"), gapValue: q(".gapvalue"), levels: q(".levels"), dbStrip: q(".dbstrip"), warnLine: q(".warnline"),
     bias: q(".bias"), spread: q(".spread"), misses: q(".misses"), extras: q(".extras"),
   };
 }
@@ -274,6 +327,66 @@ function drawStrip(card, lane, data) {
   }
 }
 
+function fmtDb(v) { return v === null || v === undefined ? "--" : v.toFixed(1) + " dB"; }
+
+// Level strip, -60 to 0 dB. Accents are filled and ghosts are rings, so the two
+// read apart without relying on shade.
+function drawDbStrip(card, lane) {
+  var c = card.dbStrip, dpr = window.devicePixelRatio || 1;
+  var w = c.clientWidth, h = c.clientHeight;
+  if (!w) return;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  var g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  var axisH = 15, plotH = h - axisH, pad = 12;
+  var x = function (db) { return pad + (Math.max(-60, Math.min(0, db)) + 60) / 60 * (w - 2 * pad); };
+  g.fillStyle = C.plot;
+  g.fillRect(0, 0, w, plotH);
+  g.font = "11px system-ui, sans-serif";
+  g.textAlign = "center";
+  g.textBaseline = "top";
+  for (var v = -60; v <= 0; v += 20) {
+    g.fillStyle = C.line;
+    g.fillRect(Math.round(x(v)), 0, 1, plotH);
+    g.fillStyle = C.ink3;
+    g.fillText(v === 0 ? "0 dB" : String(v), Math.min(x(v), w - 16), plotH + 2);
+  }
+  var d = lane.dynamics, mid = plotH / 2;
+  d.ghost_points.forEach(function (db) {
+    g.beginPath();
+    g.arc(x(db), mid, 4, 0, Math.PI * 2);
+    g.lineWidth = 1.5;
+    g.strokeStyle = hexAlpha(lane.color, 0.7);
+    g.stroke();
+  });
+  d.accent_points.forEach(function (db) {
+    g.beginPath();
+    g.arc(x(db), mid, 4, 0, Math.PI * 2);
+    g.fillStyle = hexAlpha(lane.color, 0.7);
+    g.fill();
+  });
+}
+
+function renderDynamics(card, lane) {
+  var d = lane.dynamics;
+  card.dyn.hidden = !d;
+  if (!d) return;
+  card.gapValue.textContent = fmtDb(d.gap);
+  var level = function (mean, sd) {
+    return fmtDb(mean) + (sd === null || sd === undefined ? "" : " \u00B1" + sd.toFixed(1));
+  };
+  card.levels.textContent = "Accents " + level(d.accent, d.accent_sd) +
+    "  \u00B7  Ghosts " + level(d.ghost, d.ghost_sd);
+  var warnings = [];
+  if (d.ghost_misses > 0) warnings.push(d.ghost_misses + " ghost" + (d.ghost_misses === 1 ? "" : "s") + " not detected");
+  if (d.clipped > 0) warnings.push(d.clipped + " clipped");
+  card.warnLine.textContent = warnings.join(", ");
+  drawDbStrip(card, lane);
+}
+
 function renderLane(lane, data) {
   var card = cards[lane.index];
   card.swatch.style.background = lane.color;
@@ -314,6 +427,7 @@ function renderLane(lane, data) {
   card.misses.textContent = lane.misses;
   card.extras.textContent = lane.extras;
   drawStrip(card, lane, data);
+  renderDynamics(card, lane);
 }
 
 function setBanner(id, text) {
@@ -344,9 +458,11 @@ function render() {
   }
 
   el("reset").disabled = !live;
+  el("pattern").disabled = !live;
 
   // Without a live dashboard the numbers aren't current, so don't show any.
   if (!live) {
+    el("sticking").hidden = true;
     el("transport").textContent = "";
     el("position").textContent = "";
     el("click").textContent = "";
@@ -356,6 +472,7 @@ function render() {
     return;
   }
 
+  renderPattern(data);
   el("transport").textContent = data.transport;
   el("position").textContent = (data.bpm ? data.bpm.toFixed(1) + " BPM  " : "") +
     "Bar " + data.bar + "." + Math.floor(data.beat);
@@ -367,19 +484,95 @@ function render() {
     ? "Uncalibrated: bias includes latency. Spread is valid." : "");
 
   // Create every card before drawing any, so plots measure their final width.
+  // Muted lanes aren't part of this pattern, so they don't get screen space.
+  var shown = data.lanes.filter(function (lane) { return lane.scoring; });
   var present = {};
-  data.lanes.forEach(function (lane) {
+  shown.forEach(function (lane) {
     present[lane.index] = true;
     if (!cards[lane.index]) cards[lane.index] = makeCard(lane);
   });
-  data.lanes.forEach(function (lane) { renderLane(lane, data); });
+  shown.forEach(function (lane) { renderLane(lane, data); });
   Object.keys(cards).forEach(function (k) {
     if (!present[k]) { cards[k].root.remove(); delete cards[k]; }
   });
 }
 
+var libraryRev = null, pickerValue = null;
+var CUSTOM = "__custom";
+
+function fillPicker(library) {
+  var sel = el("pattern");
+  sel.textContent = "";
+  var custom = document.createElement("option");
+  custom.value = CUSTOM;
+  custom.disabled = true;
+  sel.appendChild(custom);
+  library.groups.forEach(function (group) {
+    if (!group.items.length) return;
+    var og = document.createElement("optgroup");
+    og.label = group.title;
+    group.items.forEach(function (item) {
+      var o = document.createElement("option");
+      o.value = item.id;
+      o.textContent = item.name;
+      og.appendChild(o);
+    });
+    sel.appendChild(og);
+  });
+  pickerValue = null;
+}
+
+function loadLibrary(rev) {
+  libraryRev = rev;
+  wantLibrary = true;
+}
+
+// Grouped into beats. Capitals are accents and lowercase are ghosts, told apart
+// by size and weight as well as shade.
+function fillSticking(box, s) {
+  box.textContent = "";
+  for (var i = 0; i < s.length; i++) {
+    if (i && i % 4 === 0) {
+      var gap = document.createElement("span");
+      gap.className = "beat";
+      box.appendChild(gap);
+    }
+    var ch = s.charAt(i), span = document.createElement("span");
+    span.className = ch === "-" ? "rest" : ch === ch.toUpperCase() ? "accent" : "ghost";
+    span.textContent = ch === "-" ? "\u00B7" : ch;
+    box.appendChild(span);
+  }
+}
+
+function renderPattern(data) {
+  if (data.library_rev !== libraryRev) loadLibrary(data.library_rev);
+  var p = data.pattern;
+  var sel = el("pattern");
+  // Leave the control alone while someone is using it.
+  if (document.activeElement !== sel || pickerValue === null) {
+    var wanted = p.id && !p.modified ? p.id : CUSTOM;
+    if (wanted === CUSTOM && sel.options[0]) {
+      sel.options[0].textContent = p.name + (p.modified ? " (edited)" : "");
+    }
+    if (wanted !== pickerValue) { sel.value = wanted; pickerValue = wanted; }
+  }
+  var st = el("sticking");
+  st.hidden = !p.sticking;
+  if (p.sticking && st.dataset.shown !== p.sticking) {
+    fillSticking(st, p.sticking);
+    st.dataset.shown = p.sticking;
+  }
+}
+
+el("pattern").addEventListener("change", function () {
+  var id = el("pattern").value;
+  pickerValue = id;
+  send("SET/EXTSTATE/" + SECTION + "/command/" + encodeURIComponent("load:" + id));
+  el("pattern").blur();
+});
+
 function send(command) {
-  return request(String(command)).catch(function () {});
+  pending.push(String(command));
 }
 
 el("play").addEventListener("click", function () { send(CMD_PLAY); });
